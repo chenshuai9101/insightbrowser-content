@@ -1,0 +1,1 @@
+"FROM mcr.microsoft.com/playwright/python:v1.52.0-noble\n\nWORKDIR /app\n\nRUN pip install --no-cache-dir fastapi uvicorn pydantic httpx\n\nCOPY main.py .\nCOPY routes/ routes/\nCOPY services/ services/\n\nEXPOSE 7022\nENV PORT=7022\nCMD [\"uvicorn\", \"main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"7022\"]\n"
