@@ -1,1 +1,287 @@
-"\"\"\"Agent Browser \u6e32\u67d3\u5f15\u64ce \u2014 \u57fa\u4e8e Playwright \u7684 Headless \u6d4f\u89c8\u5668\u670d\u52a1\n\n\u4e3a Agent \u63d0\u4f9b\uff1a\n- JS\u52a8\u6001\u6e32\u67d3\uff08SPA/React/Vue\uff09\n- \u5168\u9875\u622a\u56fe\uff08JPEG/PNG\uff09\n- \u5143\u7d20\u7ea7\u622a\u56fe\n- \u61d2\u52a0\u8f7d\u56fe\u7247\u63d0\u53d6\uff08data-src/data-lazy-src\uff09\n- CSS\u80cc\u666f\u56fe\u63d0\u53d6\n- \u8868\u5355\u4ea4\u4e92\u8bc6\u522b\n- \u9875\u9762\u6587\u672c\u63d0\u53d6\uff08\u53bb\u6807\u7b7e\u7eaf\u6587\u672c\uff09\n- Cookie/Session\u4fdd\u6301\n\"\"\"\nimport asyncio\nimport logging\nimport base64\nimport re\nfrom typing import Optional\nfrom dataclasses import dataclass, field, asdict\nfrom urllib.parse import urlparse, urljoin\n\nlogger = logging.getLogger(\"agent-browser.renderer\")\n\n@dataclass\nclass RenderedPage:\n    url: str\n    title: str = \"\"\n    text: str = \"\"\n    og_image: str = \"\"\n    favicon: str = \"\"\n    images: list = field(default_factory=list)\n    videos: list = field(default_factory=list)\n    forms: list = field(default_factory=list)\n    headings: list = field(default_factory=list)\n    links: list = field(default_factory=list)\n    tables: list = field(default_factory=list)\n    screenshot_path: str = \"\"\n    load_time_ms: float = 0\n    error: str = \"\"\n\nclass AgentRenderer:\n    \"\"\"Agent \u4e13\u7528\u9875\u9762\u6e32\u67d3\u5668\"\"\"\n    \n    def __init__(self):\n        self._playwright = None\n        self._browser = None\n    \n    async def _ensure_browser(self):\n        \"\"\"\u61d2\u52a0\u8f7d\u6d4f\u89c8\u5668\u5b9e\u4f8b\"\"\"\n        if self._browser is not None:\n            return\n        from playwright.async_api import async_playwright\n        self._playwright = await async_playwright().start()\n        self._browser = await self._playwright.chromium.launch(headless=True)\n        logger.info(\"\u2705 Playwright browser launched\")\n    \n    async def render(self, url: str, wait_ms: int = 2000,\n                     viewport_width: int = 1440, viewport_height: int = 900,\n                     screenshot: bool = True, extract_images: bool = True,\n                     extract_forms: bool = True) -> RenderedPage:\n        \"\"\"\u6e32\u67d3\u4e00\u4e2a URL\uff0c\u8fd4\u56de Agent \u53ef\u6d88\u8d39\u7684\u7ed3\u6784\u5316\u6570\u636e\n        \n        Args:\n            url: \u76ee\u6807 URL\n            wait_ms: JS\u6e32\u67d3\u7b49\u5f85\u65f6\u95f4(ms)\n            viewport_width: \u89c6\u53e3\u5bbd\u5ea6\n            viewport_height: \u89c6\u53e3\u9ad8\u5ea6\n            screenshot: \u662f\u5426\u622a\u56fe\n            extract_images: \u662f\u5426\u63d0\u53d6\u56fe\u7247\n            extract_forms: \u662f\u5426\u63d0\u53d6\u8868\u5355\n        \"\"\"\n        result = RenderedPage(url=url)\n        import time\n        start = time.time()\n        \n        try:\n            await self._ensure_browser()\n            context = await self._browser.new_context(\n                viewport={\"width\": viewport_width, \"height\": viewport_height},\n                user_agent=\"InsightBrowser/2.0 (AgentBrowser; +https://insightbrowser.app)\"\n            )\n            page = await context.new_page()\n            \n            # \u52a0\u8f7d\u9875\u9762\n            await page.goto(url, wait_until=\"networkidle\", timeout=30000)\n            await asyncio.sleep(wait_ms / 1000)\n            \n            # \u6eda\u52a8\u89e6\u53d1\u61d2\u52a0\u8f7d\n            await page.evaluate(\"\"\"async () => {\n                await new Promise(r => {\n                    let h = 0;\n                    const t = setInterval(() => {\n                        window.scrollBy(0, 500);\n                        h += 500;\n                        if (h >= document.body.scrollHeight) { clearInterval(t); r(); }\n                    }, 100);\n                });\n            }\"\"\")\n            await asyncio.sleep(0.5)\n            \n            # \u63d0\u53d6\n            result.title = await page.title()\n            \n            # \u7eaf\u6587\u672c\n            result.text = (await page.evaluate(\n                \"() => document.body?.innerText?.substring(0, 10000) || ''\"\n            )).strip()\n            \n            # OG Image\n            result.og_image = (await page.evaluate(\"\"\"() => {\n                const m = document.querySelector('meta[property=\"og:image\"]');\n                return m ? m.getAttribute('content') : '';\n            }\"\"\")) or \"\"\n            \n            # Favicon\n            result.favicon = (await page.evaluate(\"\"\"() => {\n                const l = document.querySelector('link[rel*=\"icon\"]');\n                if (l) {\n                    let href = l.getAttribute('href') || '';\n                    if (href && href.startsWith('/')) href = window.location.origin + href;\n                    return href;\n                }\n                return window.location.origin + '/favicon.ico';\n            }\"\"\")) or \"\"\n            \n            # \u56fe\u7247\u63d0\u53d6\n            if extract_images:\n                result.images = await page.evaluate(\"\"\"() => {\n                    const imgs = [];\n                    const seen = new Set();\n                    // <img> tags\n                    document.querySelectorAll('img').forEach(img => {\n                        let src = img.src || img.getAttribute('data-src') ||\n                                  img.getAttribute('data-lazy-src') ||\n                                  img.getAttribute('data-original') ||\n                                  img.getAttribute('srcset');\n                        if (!src || src.startsWith('data:') || src.length < 10) return;\n                        if (src.includes(',')) src = src.split(',')[0].trim().split(' ')[0];\n                        // resolve relative\n                        if (src.startsWith('/')) src = window.location.origin + src;\n                        if (!seen.has(src) && src.startsWith('http')) {\n                            seen.add(src);\n                            imgs.push({\n                                src: src,\n                                alt: (img.alt || '').substring(0, 200),\n                                width: img.naturalWidth || img.width || 0,\n                                height: img.naturalHeight || img.height || 0,\n                                type: 'img'\n                            });\n                        }\n                    });\n                    // CSS background-image\n                    document.querySelectorAll('[style*=\"background-image\"]').forEach(el => {\n                        const style = el.getAttribute('style') || '';\n                        const m = style.match(/url\\\\([\"']?([^)\"']+)[\"']?\\\\)/);\n                        if (m && m[1].startsWith('http') && !seen.has(m[1])) {\n                            seen.add(m[1]);\n                            imgs.push({src: m[1], alt: '', width: 0, height: 0, type: 'css-bg'});\n                        }\n                    });\n                    // picture > source\n                    document.querySelectorAll('picture source').forEach(s => {\n                        const srcset = s.getAttribute('srcset') || '';\n                        if (srcset) {\n                            const first = srcset.split(',')[0].trim().split(' ')[0];\n                            if (first && !seen.has(first) && first.startsWith('http')) {\n                                seen.add(first);\n                                imgs.push({src: first, alt: '', width: 0, height: 0, type: 'picture'});\n                            }\n                        }\n                    });\n                    return imgs.slice(0, 50);\n                }\"\"\")\n            \n            # \u89c6\u9891\n            result.videos = await page.evaluate(\"\"\"() => {\n                const vids = [];\n                document.querySelectorAll('video').forEach(v => {\n                    vids.push({\n                        src: v.src || (v.querySelector('source')||{}).src || '',\n                        poster: v.getAttribute('poster') || '',\n                        type: 'html5-video'\n                    });\n                });\n                document.querySelectorAll('iframe').forEach(f => {\n                    const src = f.src || '';\n                    if (src.includes('youtube.com') || src.includes('youtu.be'))\n                        vids.push({src, type: 'youtube'});\n                    else if (src.includes('vimeo.com'))\n                        vids.push({src, type: 'vimeo'});\n                    else if (src.includes('bilibili.com'))\n                        vids.push({src, type: 'bilibili'});\n                });\n                document.querySelectorAll('audio').forEach(a => {\n                    vids.push({src: a.src || (a.querySelector('source')||{}).src || '', type: 'audio'});\n                });\n                return vids;\n            }\"\"\")\n            \n            # \u8868\u5355\n            if extract_forms:\n                result.forms = await page.evaluate(\"\"\"() => {\n                    return [...document.querySelectorAll('form')].map(f => ({\n                        action: f.action || window.location.href,\n                        method: (f.method || 'get').toLowerCase(),\n                        id: f.id || '',\n                        inputs: [...f.querySelectorAll('input,select,textarea,button')]\n                            .slice(0, 20).map(el => ({\n                                name: el.name || el.id || '',\n                                type: el.type || el.tagName.toLowerCase(),\n                                placeholder: (el.placeholder || '').substring(0, 100),\n                                required: !!el.required,\n                                tag: el.tagName.toLowerCase()\n                            }))\n                    })).filter(f => f.inputs.length > 0);\n                }\"\"\")\n            \n            # \u6807\u9898\u5c42\u7ea7\n            result.headings = await page.evaluate(\"\"\"() => {\n                return [...document.querySelectorAll('h1,h2,h3')].slice(0, 30).map(h => ({\n                    tag: h.tagName.toLowerCase(),\n                    text: h.textContent.trim().substring(0, 200)\n                }));\n            }\"\"\")\n            \n            # \u94fe\u63a5\uff08\u540c\u57df + \u8de8\u57df\u5206\u7c7b\uff09\n            raw_links = await page.evaluate(\"\"\"() => {\n                return [...document.querySelectorAll('a[href]')].map(a => ({\n                    href: a.href,\n                    text: a.textContent.trim().substring(0, 100)\n                })).filter(l => l.href.startsWith('http'));\n            }\"\"\")\n            base_domain = urlparse(url).netloc\n            result.links = []\n            for l in raw_links:\n                is_internal = urlparse(l['href']).netloc == base_domain\n                result.links.append({\n                    **l,\n                    \"internal\": is_internal,\n                    \"type\": \"page\"\n                })\n            result.links = result.links[:100]\n            \n            # \u8868\u683c\n            result.tables = await page.evaluate(\"\"\"() => {\n                return [...document.querySelectorAll('table')].slice(0, 10).map((t, i) => ({\n                    id: i,\n                    caption: (t.querySelector('caption')?.textContent || '').trim(),\n                    rows: [...t.querySelectorAll('tr')].slice(0, 50).map(tr =>\n                        [...tr.querySelectorAll('td,th')].map(cell =>\n                            cell.textContent.trim().substring(0, 200)\n                        )\n                    )\n                })).filter(t => t.rows.length > 0);\n            }\"\"\")\n            \n            # \u622a\u56fe\n            if screenshot:\n                import os, tempfile\n                safe = re.sub(r'[^a-zA-Z0-9]', '_', url)[:50]\n                import hashlib\n                fname = f\"/tmp/agent_browser_{hashlib.md5(url.encode()).hexdigest()[:12]}.jpg\"\n                await page.screenshot(path=fname, full_page=True, type=\"jpeg\", quality=70)\n                result.screenshot_path = fname\n            \n            await context.close()\n            result.load_time_ms = (time.time() - start) * 1000\n            \n        except Exception as e:\n            result.error = str(e)[:200]\n            logger.error(f\"Render error for {url}: {e}\")\n        \n        return result\n    \n    async def close(self):\n        if self._browser:\n            await self._browser.close()\n        if self._playwright:\n            await self._playwright.stop()\n\n# \u5168\u5c40\u5355\u4f8b\n_renderer: Optional[AgentRenderer] = None\n\nasync def get_renderer() -> AgentRenderer:\n    global _renderer\n    if _renderer is None:\n        _renderer = AgentRenderer()\n    return _renderer\n"
+"""Agent Browser 渲染引擎 — 基于 Playwright 的 Headless 浏览器服务
+
+为 Agent 提供：
+- JS动态渲染（SPA/React/Vue）
+- 全页截图（JPEG/PNG）
+- 元素级截图
+- 懒加载图片提取（data-src/data-lazy-src）
+- CSS背景图提取
+- 表单交互识别
+- 页面文本提取（去标签纯文本）
+- Cookie/Session保持
+"""
+import asyncio
+import logging
+import base64
+import re
+from typing import Optional
+from dataclasses import dataclass, field, asdict
+from urllib.parse import urlparse, urljoin
+
+logger = logging.getLogger("agent-browser.renderer")
+
+@dataclass
+class RenderedPage:
+    url: str
+    title: str = ""
+    text: str = ""
+    og_image: str = ""
+    favicon: str = ""
+    images: list = field(default_factory=list)
+    videos: list = field(default_factory=list)
+    forms: list = field(default_factory=list)
+    headings: list = field(default_factory=list)
+    links: list = field(default_factory=list)
+    tables: list = field(default_factory=list)
+    screenshot_path: str = ""
+    load_time_ms: float = 0
+    error: str = ""
+
+class AgentRenderer:
+    """Agent 专用页面渲染器"""
+    
+    def __init__(self):
+        self._playwright = None
+        self._browser = None
+    
+    async def _ensure_browser(self):
+        """懒加载浏览器实例"""
+        if self._browser is not None:
+            return
+        from playwright.async_api import async_playwright
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(headless=True)
+        logger.info("✅ Playwright browser launched")
+    
+    async def render(self, url: str, wait_ms: int = 2000,
+                     viewport_width: int = 1440, viewport_height: int = 900,
+                     screenshot: bool = True, extract_images: bool = True,
+                     extract_forms: bool = True) -> RenderedPage:
+        """渲染一个 URL，返回 Agent 可消费的结构化数据
+        
+        Args:
+            url: 目标 URL
+            wait_ms: JS渲染等待时间(ms)
+            viewport_width: 视口宽度
+            viewport_height: 视口高度
+            screenshot: 是否截图
+            extract_images: 是否提取图片
+            extract_forms: 是否提取表单
+        """
+        result = RenderedPage(url=url)
+        import time
+        start = time.time()
+        
+        try:
+            await self._ensure_browser()
+            context = await self._browser.new_context(
+                viewport={"width": viewport_width, "height": viewport_height},
+                user_agent="InsightBrowser/2.0 (AgentBrowser; +https://insightbrowser.app)"
+            )
+            page = await context.new_page()
+            
+            # 加载页面
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(wait_ms / 1000)
+            
+            # 滚动触发懒加载
+            await page.evaluate("""async () => {
+                await new Promise(r => {
+                    let h = 0;
+                    const t = setInterval(() => {
+                        window.scrollBy(0, 500);
+                        h += 500;
+                        if (h >= document.body.scrollHeight) { clearInterval(t); r(); }
+                    }, 100);
+                });
+            }""")
+            await asyncio.sleep(0.5)
+            
+            # 提取
+            result.title = await page.title()
+            
+            # 纯文本
+            result.text = (await page.evaluate(
+                "() => document.body?.innerText?.substring(0, 10000) || ''"
+            )).strip()
+            
+            # OG Image
+            result.og_image = (await page.evaluate("""() => {
+                const m = document.querySelector('meta[property="og:image"]');
+                return m ? m.getAttribute('content') : '';
+            }""")) or ""
+            
+            # Favicon
+            result.favicon = (await page.evaluate("""() => {
+                const l = document.querySelector('link[rel*="icon"]');
+                if (l) {
+                    let href = l.getAttribute('href') || '';
+                    if (href && href.startsWith('/')) href = window.location.origin + href;
+                    return href;
+                }
+                return window.location.origin + '/favicon.ico';
+            }""")) or ""
+            
+            # 图片提取
+            if extract_images:
+                result.images = await page.evaluate("""() => {
+                    const imgs = [];
+                    const seen = new Set();
+                    // <img> tags
+                    document.querySelectorAll('img').forEach(img => {
+                        let src = img.src || img.getAttribute('data-src') ||
+                                  img.getAttribute('data-lazy-src') ||
+                                  img.getAttribute('data-original') ||
+                                  img.getAttribute('srcset');
+                        if (!src || src.startsWith('data:') || src.length < 10) return;
+                        if (src.includes(',')) src = src.split(',')[0].trim().split(' ')[0];
+                        // resolve relative
+                        if (src.startsWith('/')) src = window.location.origin + src;
+                        if (!seen.has(src) && src.startsWith('http')) {
+                            seen.add(src);
+                            imgs.push({
+                                src: src,
+                                alt: (img.alt || '').substring(0, 200),
+                                width: img.naturalWidth || img.width || 0,
+                                height: img.naturalHeight || img.height || 0,
+                                type: 'img'
+                            });
+                        }
+                    });
+                    // CSS background-image
+                    document.querySelectorAll('[style*="background-image"]').forEach(el => {
+                        const style = el.getAttribute('style') || '';
+                        const m = style.match(/url\\(["']?([^)"']+)["']?\\)/);
+                        if (m && m[1].startsWith('http') && !seen.has(m[1])) {
+                            seen.add(m[1]);
+                            imgs.push({src: m[1], alt: '', width: 0, height: 0, type: 'css-bg'});
+                        }
+                    });
+                    // picture > source
+                    document.querySelectorAll('picture source').forEach(s => {
+                        const srcset = s.getAttribute('srcset') || '';
+                        if (srcset) {
+                            const first = srcset.split(',')[0].trim().split(' ')[0];
+                            if (first && !seen.has(first) && first.startsWith('http')) {
+                                seen.add(first);
+                                imgs.push({src: first, alt: '', width: 0, height: 0, type: 'picture'});
+                            }
+                        }
+                    });
+                    return imgs.slice(0, 50);
+                }""")
+            
+            # 视频
+            result.videos = await page.evaluate("""() => {
+                const vids = [];
+                document.querySelectorAll('video').forEach(v => {
+                    vids.push({
+                        src: v.src || (v.querySelector('source')||{}).src || '',
+                        poster: v.getAttribute('poster') || '',
+                        type: 'html5-video'
+                    });
+                });
+                document.querySelectorAll('iframe').forEach(f => {
+                    const src = f.src || '';
+                    if (src.includes('youtube.com') || src.includes('youtu.be'))
+                        vids.push({src, type: 'youtube'});
+                    else if (src.includes('vimeo.com'))
+                        vids.push({src, type: 'vimeo'});
+                    else if (src.includes('bilibili.com'))
+                        vids.push({src, type: 'bilibili'});
+                });
+                document.querySelectorAll('audio').forEach(a => {
+                    vids.push({src: a.src || (a.querySelector('source')||{}).src || '', type: 'audio'});
+                });
+                return vids;
+            }""")
+            
+            # 表单
+            if extract_forms:
+                result.forms = await page.evaluate("""() => {
+                    return [...document.querySelectorAll('form')].map(f => ({
+                        action: f.action || window.location.href,
+                        method: (f.method || 'get').toLowerCase(),
+                        id: f.id || '',
+                        inputs: [...f.querySelectorAll('input,select,textarea,button')]
+                            .slice(0, 20).map(el => ({
+                                name: el.name || el.id || '',
+                                type: el.type || el.tagName.toLowerCase(),
+                                placeholder: (el.placeholder || '').substring(0, 100),
+                                required: !!el.required,
+                                tag: el.tagName.toLowerCase()
+                            }))
+                    })).filter(f => f.inputs.length > 0);
+                }""")
+            
+            # 标题层级
+            result.headings = await page.evaluate("""() => {
+                return [...document.querySelectorAll('h1,h2,h3')].slice(0, 30).map(h => ({
+                    tag: h.tagName.toLowerCase(),
+                    text: h.textContent.trim().substring(0, 200)
+                }));
+            }""")
+            
+            # 链接（同域 + 跨域分类）
+            raw_links = await page.evaluate("""() => {
+                return [...document.querySelectorAll('a[href]')].map(a => ({
+                    href: a.href,
+                    text: a.textContent.trim().substring(0, 100)
+                })).filter(l => l.href.startsWith('http'));
+            }""")
+            base_domain = urlparse(url).netloc
+            result.links = []
+            for l in raw_links:
+                is_internal = urlparse(l['href']).netloc == base_domain
+                result.links.append({
+                    **l,
+                    "internal": is_internal,
+                    "type": "page"
+                })
+            result.links = result.links[:100]
+            
+            # 表格
+            result.tables = await page.evaluate("""() => {
+                return [...document.querySelectorAll('table')].slice(0, 10).map((t, i) => ({
+                    id: i,
+                    caption: (t.querySelector('caption')?.textContent || '').trim(),
+                    rows: [...t.querySelectorAll('tr')].slice(0, 50).map(tr =>
+                        [...tr.querySelectorAll('td,th')].map(cell =>
+                            cell.textContent.trim().substring(0, 200)
+                        )
+                    )
+                })).filter(t => t.rows.length > 0);
+            }""")
+            
+            # 截图
+            if screenshot:
+                import os, tempfile
+                safe = re.sub(r'[^a-zA-Z0-9]', '_', url)[:50]
+                import hashlib
+                fname = f"/tmp/agent_browser_{hashlib.md5(url.encode()).hexdigest()[:12]}.jpg"
+                await page.screenshot(path=fname, full_page=True, type="jpeg", quality=70)
+                result.screenshot_path = fname
+            
+            await context.close()
+            result.load_time_ms = (time.time() - start) * 1000
+            
+        except Exception as e:
+            result.error = str(e)[:200]
+            logger.error(f"Render error for {url}: {e}")
+        
+        return result
+    
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+
+# 全局单例
+_renderer: Optional[AgentRenderer] = None
+
+async def get_renderer() -> AgentRenderer:
+    global _renderer
+    if _renderer is None:
+        _renderer = AgentRenderer()
+    return _renderer
