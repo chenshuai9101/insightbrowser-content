@@ -1,1 +1,390 @@
-"\"\"\"Agent \u6d4f\u89c8\u5668 API \u8def\u7531\n\nPOST /open            - \u6253\u5f00 URL\uff0c\u8fd4\u56de\u7ed3\u6784\u5316\u9875\u9762\u6570\u636e\nPOST /traverse        - BFS \u904d\u5386\u9875\u9762\u6811\nPOST /screenshot      - \u622a\u56fe\nPOST /extract         - \u63d0\u53d6\u7ed3\u6784\u5316\u6570\u636e\nPOST /compare         - diff \u4e24\u4e2a\u9875\u9762\u7248\u672c\nPOST /capture         - \u6293\u53d6\u591a\u5a92\u4f53\u8d44\u6e90\nPOST /paginate        - \u7ffb\u9875\u904d\u5386\uff08\u591a\u9875\u6570\u636e\u63d0\u53d6\uff09\nPOST /fill-form       - \u8bc6\u522b\u5e76\u586b\u5145\u8868\u5355\nPOST /multi-step      - \u591a\u6b65\u8868\u5355\u5411\u5bfc\nPOST /login           - \u81ea\u52a8\u767b\u5f55 + Session \u4fdd\u6301\nGET  /sessions        - \u5217\u51fa\u5df2\u4fdd\u5b58\u7684 Session\nPOST /login-check     - \u68c0\u6d4b\u9875\u9762\u662f\u5426\u9700\u8981\u767b\u5f55\n\"\"\"\nfrom fastapi import APIRouter, Query, HTTPException\nfrom pydantic import BaseModel, Field\nfrom typing import Optional, Dict, List\nimport logging\nimport json\n\nfrom services.renderer import get_renderer\nfrom services.crawler import AgentCrawler\nfrom services.extractor import extract_structured_data\nfrom services.pagination import PaginationEngine, PaginationResult\nfrom services.forms import FormEngine, FormResult, MultiStepResult\nfrom services.login import LoginEngine, LoginResult\n\nlogger = logging.getLogger(\"agent-browser.routes\")\nrouter = APIRouter(prefix=\"/api/v1/agent-browser\", tags=[\"Agent Browser\"])\n\n# \u2500\u2500\u2500 Request Models \u2500\u2500\u2500\n\nclass OpenRequest(BaseModel):\n    url: str = Field(..., description=\"\u76ee\u6807 URL\")\n    wait_ms: int = Field(default=2000, description=\"JS\u6e32\u67d3\u7b49\u5f85\u65f6\u95f4(ms)\")\n    viewport_width: int = Field(default=1440)\n    viewport_height: int = Field(default=900)\n    screenshot: bool = Field(default=True, description=\"\u662f\u5426\u622a\u56fe\")\n    extract_images: bool = Field(default=True, description=\"\u662f\u5426\u63d0\u53d6\u56fe\u7247\")\n    extract_forms: bool = Field(default=True, description=\"\u662f\u5426\u63d0\u53d6\u8868\u5355\")\n\nclass TraverseRequest(BaseModel):\n    url: str = Field(..., description=\"\u6839 URL\")\n    depth: int = Field(default=2, ge=0, le=4, description=\"\u904d\u5386\u6df1\u5ea6\")\n    max_pages: int = Field(default=50, ge=1, le=200, description=\"\u6700\u591a\u9875\u9762\u6570\")\n    same_domain_only: bool = Field(default=True)\n\nclass CompareRequest(BaseModel):\n    url: str = Field(...)\n    previous_snapshot: Optional[dict] = Field(default=None, description=\"\u4e0a\u6b21\u7684\u9875\u9762\u5feb\u7167\")\n\nclass CaptureRequest(BaseModel):\n    url: str = Field(...)\n    capture_type: str = Field(default=\"all\", description=\"all | images | videos | screenshots\")\n\n\n# \u2500\u2500\u2500 Routes \u2500\u2500\u2500\n\n@router.post(\"/open\")\nasync def open_page(req: OpenRequest):\n    \"\"\"\u6253\u5f00 URL \u5e76\u8fd4\u56de Agent \u53ef\u6d88\u8d39\u7684\u7ed3\u6784\u5316\u9875\u9762\u6570\u636e\n    \n    \u8fd4\u56de\uff1a\n    - page: \u9875\u9762\u5143\u6570\u636e\uff08\u6807\u9898\u3001\u6587\u672c\u3001OG\u56fe\u3001Favicon\uff09\n    - images: \u56fe\u7247\u5217\u8868\uff08\u542b\u61d2\u52a0\u8f7d\u7684data-src\u3001CSS\u80cc\u666f\u56fe\uff09\n    - videos: \u89c6\u9891/\u97f3\u9891\u5217\u8868\n    - forms: \u8868\u5355\u5143\u7d20\uff08Agent \u53ef\u636e\u6b64\u4ea4\u4e92\uff09\n    - links: \u94fe\u63a5\u5217\u8868\uff08\u540c\u57df/\u8de8\u57df\u5206\u7c7b\uff09\n    - tables: HTML \u8868\u683c\u6570\u636e\n    - screenshot_path: \u622a\u56fe\u6587\u4ef6\u8def\u5f84\n    - structured: \u63d0\u53d6\u7684\u7ed3\u6784\u5316\u6570\u636e\uff08\u4ef7\u683c\u3001\u952e\u503c\u5bf9\u7b49\uff09\n    \"\"\"\n    renderer = await get_renderer()\n    page = await renderer.render(\n        url=req.url,\n        wait_ms=req.wait_ms,\n        viewport_width=req.viewport_width,\n        viewport_height=req.viewport_height,\n        screenshot=req.screenshot,\n        extract_images=req.extract_images,\n        extract_forms=req.extract_forms,\n    )\n    \n    from dataclasses import asdict\n    result = asdict(page)\n    \n    # \u7ed3\u6784\u5316\u63d0\u53d6\n    result[\"structured\"] = extract_structured_data(result)\n    \n    return {\n        \"success\": not bool(page.error),\n        \"url\": req.url,\n        \"error\": page.error,\n        \"data\": result,\n    }\n\n\n@router.post(\"/traverse\")\nasync def traverse_pages(req: TraverseRequest):\n    \"\"\"BFS \u904d\u5386\u9875\u9762\u6811\n    \n    Agent \u89c6\u89d2\uff1a\u8f93\u5165\u6839URL\uff0c\u81ea\u52a8\u9012\u5f52\u5b50\u9875\u9762\uff0c\u8fd4\u56de\u5b8c\u6574\u7ad9\u70b9\u5730\u56fe\n    \n    \u8fd4\u56de\uff1a\n    - root: \u6839\u8282\u70b9\uff08\u542b\u5b50\u8282\u70b9\u6811\uff09\n    - total_pages: \u603b\u9875\u9762\u6570\n    - stats: \u7edf\u8ba1\uff08\u6807\u9898\u6570\u3001\u56fe\u7247\u6570\u3001\u94fe\u63a5\u6570\u3001\u9519\u8bef\u6570\uff09\n    \"\"\"\n    renderer = await get_renderer()\n    crawler = AgentCrawler(renderer)\n    result = await crawler.traverse(\n        url=req.url,\n        depth=req.depth,\n        max_pages=req.max_pages,\n        same_domain_only=req.same_domain_only,\n    )\n    \n    return {\n        \"success\": True,\n        \"url\": req.url,\n        \"total_pages\": result[\"total_pages\"],\n        \"stats\": result[\"stats\"],\n        \"root_title\": result[\"root\"].title,\n        \"root_children_count\": len(result[\"root\"].children),\n    }\n\n\n@router.post(\"/screenshot\")\nasync def take_screenshot(url: str = Query(...), full_page: bool = True):\n    \"\"\"\u5bf9\u6307\u5b9a URL \u622a\u56fe\u5e76\u8fd4\u56de\u8def\u5f84\"\"\"\n    renderer = await get_renderer()\n    page = await renderer.render(url, screenshot=True)\n    \n    return {\n        \"success\": not bool(page.error),\n        \"url\": url,\n        \"screenshot_path\": page.screenshot_path,\n        \"title\": page.title,\n        \"load_time_ms\": page.load_time_ms,\n    }\n\n\n@router.post(\"/extract\")\nasync def extract_structured(req: OpenRequest):\n    \"\"\"\u63d0\u53d6\u9875\u9762\u7684\u7ed3\u6784\u5316\u6570\u636e\uff08\u4ef7\u683c\u3001\u952e\u503c\u5bf9\u3001\u8868\u683c\u3001\u8868\u5355\u7b49\uff09\"\"\"\n    renderer = await get_renderer()\n    page = await renderer.render(\n        url=req.url, wait_ms=req.wait_ms,\n        screenshot=False, extract_images=True, extract_forms=True,\n    )\n    \n    from dataclasses import asdict\n    result = extract_structured_data(asdict(page))\n    \n    return {\n        \"success\": not bool(page.error),\n        \"url\": req.url,\n        \"title\": page.title,\n        \"structured\": result,\n    }\n\n\n@router.post(\"/compare\")\nasync def compare_pages(req: CompareRequest):\n    \"\"\"\u5bf9\u6bd4\u5f53\u524d\u9875\u9762\u4e0e\u4e4b\u524d\u7684\u5feb\u7167\uff0c\u68c0\u6d4b\u53d8\u66f4\n    \n    Agent \u76d1\u63a7\u573a\u666f\uff1a\u5b9a\u671f\u91cd\u8bbf\u540c\u4e00 URL\uff0c\u53d1\u73b0\u53d8\u5316\n    \"\"\"\n    renderer = await get_renderer()\n    page = await renderer.render(req.url, screenshot=False)\n    \n    from dataclasses import asdict\n    current = asdict(page)\n    \n    changes = {\n        \"title_changed\": False,\n        \"text_similarity\": 1.0,\n        \"new_images\": 0,\n        \"new_links\": 0,\n        \"removed_links\": 0,\n    }\n    \n    if req.previous_snapshot:\n        prev = req.previous_snapshot\n        changes[\"title_changed\"] = prev.get(\"title\") != current.get(\"title\")\n        \n        # \u7b80\u5355\u6587\u672c\u76f8\u4f3c\u5ea6\uff08Jaccard\uff09\n        prev_words = set((prev.get(\"text\", \"\") or \"\").split())\n        curr_words = set((current.get(\"text\", \"\") or \"\").split())\n        if prev_words or curr_words:\n            intersection = prev_words & curr_words\n            union = prev_words | curr_words\n            changes[\"text_similarity\"] = len(intersection) / max(len(union), 1)\n        \n        prev_imgs = len(prev.get(\"images\") or [])\n        curr_imgs = len(current.get(\"images\") or [])\n        changes[\"new_images\"] = max(0, curr_imgs - prev_imgs)\n        \n        prev_links = set(l.get(\"href\",\"\") for l in (prev.get(\"links\") or []))\n        curr_links = set(l.get(\"href\",\"\") for l in (current.get(\"links\") or []))\n        changes[\"new_links\"] = len(curr_links - prev_links)\n        changes[\"removed_links\"] = len(prev_links - curr_links)\n    \n    return {\n        \"success\": True,\n        \"url\": req.url,\n        \"current_title\": page.title,\n        \"changes\": changes,\n        \"has_changes\": changes[\"title_changed\"] or changes[\"text_similarity\"] < 0.95 or changes[\"new_images\"] > 0 or changes[\"new_links\"] > 0,\n    }\n\n\n# \u2500\u2500\u2500 Pagination \u2500\u2500\u2500\n\n@router.post(\"/paginate\")\nasync def paginate_pages(req: OpenRequest, max_pages: int = 10):\n    \"\"\"\u81ea\u52a8\u7ffb\u9875\u904d\u5386 \u2014 Agent \u89c6\u89d2\u7684\u5206\u9875\u63d0\u53d6\n    \n    \u81ea\u52a8\u68c0\u6d4b\"\u4e0b\u4e00\u9875\"\u6309\u94ae\uff0c\u9010\u9875\u63d0\u53d6\u7ed3\u6784\u5316\u6570\u636e\u3002\n    \u652f\u6301\uff1a\u94fe\u63a5\u7ffb\u9875\u3001URL\u53c2\u6570\u7ffb\u9875\uff08?page=N\uff09\u3001\u5206\u9875\u5217\u8868\u3002\n    \"\"\"\n    renderer = await get_renderer()\n    engine = PaginationEngine()\n    \n    # \u5148\u6e32\u67d3\u7b2c\u4e00\u9875\n    page = await renderer.render(url=req.url, wait_ms=req.wait_ms,\n        screenshot=False, extract_images=True, extract_forms=True)\n    from dataclasses import asdict\n    page_data = asdict(page)\n    page_data[\"structured\"] = extract_structured_data(page_data)\n    \n    result = await engine.paginate(renderer, req.url, page_data, max_pages=max_pages)\n    \n    return {\n        \"success\": True,\n        \"url\": req.url,\n        \"total_pages\": result.total_pages,\n        \"pagination_type\": result.pagination_type,\n        \"next_selector\": result.next_selector,\n        \"errors\": result.errors,\n        \"elapsed_ms\": result.elapsed_ms,\n        \"pages\": [\n            {\"page\": p[\"page\"], \"title\": p[\"data\"].get(\"title\", \"\"),\n             \"text_length\": len(p[\"data\"].get(\"text\", \"\")),\n             \"structured\": p[\"data\"].get(\"structured\", {})}\n            for p in result.pages\n        ],\n    }\n\n\n# \u2500\u2500\u2500 Form Fill \u2500\u2500\u2500\n\nclass FormFillRequest(BaseModel):\n    url: str = Field(..., description=\"\u76ee\u6807 URL\")\n    form_index: int = Field(default=0, description=\"\u8868\u5355\u5e8f\u53f7\")\n    custom_fields: Optional[Dict[str, str]] = Field(default=None, description=\"\u81ea\u5b9a\u4e49\u586b\u5145\u503c\")\n    submit: bool = Field(default=True, description=\"\u662f\u5426\u63d0\u4ea4\")\n    wait_ms: int = Field(default=1500)\n\nclass MultiStepRequest(BaseModel):\n    url: str = Field(..., description=\"\u8868\u5355\u5411\u5bfc\u8d77\u59cb URL\")\n    steps_data: List[Dict[str, str]] = Field(default=[], description=\"\u6bcf\u6b65\u7684\u586b\u5145\u6570\u636e\")\n    max_steps: int = Field(default=5)\n\n@router.post(\"/fill-form\")\nasync def fill_form(req: FormFillRequest):\n    \"\"\"\u667a\u80fd\u8bc6\u522b\u5e76\u586b\u5145\u8868\u5355\n    \n    Agent \u89c6\u89d2\uff1a\u7ed9\u4e00\u4e2a URL\uff0c\u81ea\u52a8\u68c0\u6d4b\u8868\u5355\uff0c\u6839\u636e\u5b57\u6bb5\u540d\u667a\u80fd\u586b\u5145\uff0c\u53ef\u9009\u63d0\u4ea4\u3002\n    \u652f\u6301\uff1atext/select/checkbox/radio/textarea\u3002\n    \"\"\"\n    renderer = await get_renderer()\n    engine = FormEngine()\n    result = await engine.fill_and_submit(\n        renderer, req.url, req.form_index, req.custom_fields, req.submit\n    )\n    return {\n        \"success\": not bool(result.error),\n        \"url\": req.url,\n        \"form_id\": result.form_id,\n        \"action\": result.action,\n        \"method\": result.method,\n        \"fields_detected\": len(result.fields),\n        \"fields_filled\": result.filled,\n        \"submitted\": result.submitted,\n        \"response_title\": result.response_title,\n        \"response_text\": result.response_text[:500] if result.response_text else \"\",\n        \"error\": result.error,\n        \"elapsed_ms\": result.elapsed_ms,\n    }\n\n@router.post(\"/multi-step\")\nasync def multi_step_form(req: MultiStepRequest):\n    \"\"\"\u591a\u6b65\u8868\u5355\u5411\u5bfc \u2014 \u81ea\u52a8\u586b\u5145\u591a\u9875\u8868\u5355\n    \n    Agent \u89c6\u89d2\uff1a\u6ce8\u518c\u5411\u5bfc\u3001\u8d2d\u7269\u7ed3\u8d26\u7b49\u591a\u6b65\u6d41\u7a0b\u3002\n    \"\"\"\n    renderer = await get_renderer()\n    engine = FormEngine()\n    result = await engine.multi_step_wizard(\n        renderer, req.url, req.steps_data, req.max_steps\n    )\n    return {\n        \"success\": result.completed,\n        \"url\": req.url,\n        \"total_steps\": result.total_steps,\n        \"completed\": result.completed,\n        \"final_url\": result.final_url,\n        \"elapsed_ms\": result.elapsed_ms,\n    }\n\n\n# \u2500\u2500\u2500 Login / Session \u2500\u2500\u2500\n\nclass LoginRequest(BaseModel):\n    login_url: str = Field(..., description=\"\u767b\u5f55\u9875 URL\")\n    username: str = Field(..., description=\"\u7528\u6237\u540d/\u90ae\u7bb1\")\n    password: str = Field(..., description=\"\u5bc6\u7801\")\n    custom_fields: Optional[Dict[str, str]] = Field(default=None, description=\"\u989d\u5916\u5b57\u6bb5\uff08\u9a8c\u8bc1\u7801\u7b49\uff09\")\n\nclass LoginCheckRequest(BaseModel):\n    url: str = Field(..., description=\"\u68c0\u6d4b\u9875\u9762 URL\")\n\n@router.post(\"/login\")\nasync def login_to_site(req: LoginRequest):\n    \"\"\"\u81ea\u52a8\u767b\u5f55 + Session \u6301\u4e45\u5316\n    \n    Agent \u89c6\u89d2\uff1a\u7ed9\u5b9a\u767b\u5f55\u9875 URL + \u51ed\u8bc1\uff0c\u81ea\u52a8\u68c0\u6d4b\u767b\u5f55\u8868\u5355\u3001\u586b\u5145\u3001\u63d0\u4ea4\uff0c\n    \u4fdd\u5b58 Cookie \u4e3a Session \u4f9b\u540e\u7eed\u8bf7\u6c42\u4f7f\u7528\u3002\n    \"\"\"\n    renderer = await get_renderer()\n    engine = LoginEngine()\n    result = await engine.login(\n        renderer, req.login_url, req.username, req.password, req.custom_fields\n    )\n    return {\n        \"success\": result.success,\n        \"login_url\": req.login_url,\n        \"detection_method\": result.detection_method,\n        \"filled_fields\": {k: (\"***\" if \"password\" in k.lower() else v) for k, v in result.filled_fields.items()},\n        \"cookies_count\": result.cookies_count,\n        \"session_id\": result.session_id,\n        \"redirect_url\": result.redirect_url,\n        \"response_title\": result.response_title,\n        \"error\": result.error,\n        \"elapsed_ms\": result.elapsed_ms,\n    }\n\n@router.get(\"/sessions\")\nasync def list_sessions():\n    \"\"\"\u5217\u51fa\u6240\u6709\u5df2\u4fdd\u5b58\u7684 Session\"\"\"\n    engine = LoginEngine()\n    sessions = engine.list_sessions()\n    return {\"sessions\": sessions, \"count\": len(sessions)}\n\n@router.post(\"/login-check\")\nasync def check_login_needed(req: LoginCheckRequest):\n    \"\"\"\u68c0\u6d4b\u9875\u9762\u662f\u5426\u9700\u8981\u767b\u5f55\"\"\"\n    renderer = await get_renderer()\n    engine = LoginEngine()\n    login_form = await engine.detect_login_form(renderer, req.url)\n    return {\n        \"url\": req.url,\n        \"login_required\": login_form is not None,\n        \"login_form_detected\": login_form is not None,\n        \"username_field\": login_form.get(\"username_field\", {}).get(\"name\") if login_form else None,\n        \"form_action\": login_form.get(\"form_action\") if login_form else None,\n    }\n\n\n@router.post(\"/capture\")\nasync def capture_media(req: CaptureRequest):\n    \"\"\"\u6293\u53d6\u9875\u9762\u7684\u591a\u5a92\u4f53\u8d44\u6e90\uff08\u56fe\u7247\u3001\u89c6\u9891\u3001\u622a\u56fe\uff09\"\"\"\n    renderer = await get_renderer()\n    page = await renderer.render(req.url, screenshot=True, extract_images=True)\n    \n    from dataclasses import asdict\n    data = asdict(page)\n    \n    return {\n        \"success\": not bool(page.error),\n        \"url\": req.url,\n        \"title\": page.title,\n        \"images\": data.get(\"images\", [])[:20],\n        \"videos\": data.get(\"videos\", []),\n        \"screenshot\": data.get(\"screenshot_path\", \"\"),\n        \"og_image\": data.get(\"og_image\", \"\"),\n        \"favicon\": data.get(\"favicon\", \"\"),\n    }\n"
+"""Agent 浏览器 API 路由
+
+POST /open            - 打开 URL，返回结构化页面数据
+POST /traverse        - BFS 遍历页面树
+POST /screenshot      - 截图
+POST /extract         - 提取结构化数据
+POST /compare         - diff 两个页面版本
+POST /capture         - 抓取多媒体资源
+POST /paginate        - 翻页遍历（多页数据提取）
+POST /fill-form       - 识别并填充表单
+POST /multi-step      - 多步表单向导
+POST /login           - 自动登录 + Session 保持
+GET  /sessions        - 列出已保存的 Session
+POST /login-check     - 检测页面是否需要登录
+"""
+from fastapi import APIRouter, Query, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, List
+import logging
+import json
+
+from services.renderer import get_renderer
+from services.crawler import AgentCrawler
+from services.extractor import extract_structured_data
+from services.pagination import PaginationEngine, PaginationResult
+from services.forms import FormEngine, FormResult, MultiStepResult
+from services.login import LoginEngine, LoginResult
+
+logger = logging.getLogger("agent-browser.routes")
+router = APIRouter(prefix="/api/v1/agent-browser", tags=["Agent Browser"])
+
+# ─── Request Models ───
+
+class OpenRequest(BaseModel):
+    url: str = Field(..., description="目标 URL")
+    wait_ms: int = Field(default=2000, description="JS渲染等待时间(ms)")
+    viewport_width: int = Field(default=1440)
+    viewport_height: int = Field(default=900)
+    screenshot: bool = Field(default=True, description="是否截图")
+    extract_images: bool = Field(default=True, description="是否提取图片")
+    extract_forms: bool = Field(default=True, description="是否提取表单")
+
+class TraverseRequest(BaseModel):
+    url: str = Field(..., description="根 URL")
+    depth: int = Field(default=2, ge=0, le=4, description="遍历深度")
+    max_pages: int = Field(default=50, ge=1, le=200, description="最多页面数")
+    same_domain_only: bool = Field(default=True)
+
+class CompareRequest(BaseModel):
+    url: str = Field(...)
+    previous_snapshot: Optional[dict] = Field(default=None, description="上次的页面快照")
+
+class CaptureRequest(BaseModel):
+    url: str = Field(...)
+    capture_type: str = Field(default="all", description="all | images | videos | screenshots")
+
+
+# ─── Routes ───
+
+@router.post("/open")
+async def open_page(req: OpenRequest):
+    """打开 URL 并返回 Agent 可消费的结构化页面数据
+    
+    返回：
+    - page: 页面元数据（标题、文本、OG图、Favicon）
+    - images: 图片列表（含懒加载的data-src、CSS背景图）
+    - videos: 视频/音频列表
+    - forms: 表单元素（Agent 可据此交互）
+    - links: 链接列表（同域/跨域分类）
+    - tables: HTML 表格数据
+    - screenshot_path: 截图文件路径
+    - structured: 提取的结构化数据（价格、键值对等）
+    """
+    renderer = await get_renderer()
+    page = await renderer.render(
+        url=req.url,
+        wait_ms=req.wait_ms,
+        viewport_width=req.viewport_width,
+        viewport_height=req.viewport_height,
+        screenshot=req.screenshot,
+        extract_images=req.extract_images,
+        extract_forms=req.extract_forms,
+    )
+    
+    from dataclasses import asdict
+    result = asdict(page)
+    
+    # 结构化提取
+    result["structured"] = extract_structured_data(result)
+    
+    return {
+        "success": not bool(page.error),
+        "url": req.url,
+        "error": page.error,
+        "data": result,
+    }
+
+
+@router.post("/traverse")
+async def traverse_pages(req: TraverseRequest):
+    """BFS 遍历页面树
+    
+    Agent 视角：输入根URL，自动递归子页面，返回完整站点地图
+    
+    返回：
+    - root: 根节点（含子节点树）
+    - total_pages: 总页面数
+    - stats: 统计（标题数、图片数、链接数、错误数）
+    """
+    renderer = await get_renderer()
+    crawler = AgentCrawler(renderer)
+    result = await crawler.traverse(
+        url=req.url,
+        depth=req.depth,
+        max_pages=req.max_pages,
+        same_domain_only=req.same_domain_only,
+    )
+    
+    return {
+        "success": True,
+        "url": req.url,
+        "total_pages": result["total_pages"],
+        "stats": result["stats"],
+        "root_title": result["root"].title,
+        "root_children_count": len(result["root"].children),
+    }
+
+
+@router.post("/screenshot")
+async def take_screenshot(url: str = Query(...), full_page: bool = True):
+    """对指定 URL 截图并返回路径"""
+    renderer = await get_renderer()
+    page = await renderer.render(url, screenshot=True)
+    
+    return {
+        "success": not bool(page.error),
+        "url": url,
+        "screenshot_path": page.screenshot_path,
+        "title": page.title,
+        "load_time_ms": page.load_time_ms,
+    }
+
+
+@router.post("/extract")
+async def extract_structured(req: OpenRequest):
+    """提取页面的结构化数据（价格、键值对、表格、表单等）"""
+    renderer = await get_renderer()
+    page = await renderer.render(
+        url=req.url, wait_ms=req.wait_ms,
+        screenshot=False, extract_images=True, extract_forms=True,
+    )
+    
+    from dataclasses import asdict
+    result = extract_structured_data(asdict(page))
+    
+    return {
+        "success": not bool(page.error),
+        "url": req.url,
+        "title": page.title,
+        "structured": result,
+    }
+
+
+@router.post("/compare")
+async def compare_pages(req: CompareRequest):
+    """对比当前页面与之前的快照，检测变更
+    
+    Agent 监控场景：定期重访同一 URL，发现变化
+    """
+    renderer = await get_renderer()
+    page = await renderer.render(req.url, screenshot=False)
+    
+    from dataclasses import asdict
+    current = asdict(page)
+    
+    changes = {
+        "title_changed": False,
+        "text_similarity": 1.0,
+        "new_images": 0,
+        "new_links": 0,
+        "removed_links": 0,
+    }
+    
+    if req.previous_snapshot:
+        prev = req.previous_snapshot
+        changes["title_changed"] = prev.get("title") != current.get("title")
+        
+        # 简单文本相似度（Jaccard）
+        prev_words = set((prev.get("text", "") or "").split())
+        curr_words = set((current.get("text", "") or "").split())
+        if prev_words or curr_words:
+            intersection = prev_words & curr_words
+            union = prev_words | curr_words
+            changes["text_similarity"] = len(intersection) / max(len(union), 1)
+        
+        prev_imgs = len(prev.get("images") or [])
+        curr_imgs = len(current.get("images") or [])
+        changes["new_images"] = max(0, curr_imgs - prev_imgs)
+        
+        prev_links = set(l.get("href","") for l in (prev.get("links") or []))
+        curr_links = set(l.get("href","") for l in (current.get("links") or []))
+        changes["new_links"] = len(curr_links - prev_links)
+        changes["removed_links"] = len(prev_links - curr_links)
+    
+    return {
+        "success": True,
+        "url": req.url,
+        "current_title": page.title,
+        "changes": changes,
+        "has_changes": changes["title_changed"] or changes["text_similarity"] < 0.95 or changes["new_images"] > 0 or changes["new_links"] > 0,
+    }
+
+
+# ─── Pagination ───
+
+@router.post("/paginate")
+async def paginate_pages(req: OpenRequest, max_pages: int = 10):
+    """自动翻页遍历 — Agent 视角的分页提取
+    
+    自动检测"下一页"按钮，逐页提取结构化数据。
+    支持：链接翻页、URL参数翻页（?page=N）、分页列表。
+    """
+    renderer = await get_renderer()
+    engine = PaginationEngine()
+    
+    # 先渲染第一页
+    page = await renderer.render(url=req.url, wait_ms=req.wait_ms,
+        screenshot=False, extract_images=True, extract_forms=True)
+    from dataclasses import asdict
+    page_data = asdict(page)
+    page_data["structured"] = extract_structured_data(page_data)
+    
+    result = await engine.paginate(renderer, req.url, page_data, max_pages=max_pages)
+    
+    return {
+        "success": True,
+        "url": req.url,
+        "total_pages": result.total_pages,
+        "pagination_type": result.pagination_type,
+        "next_selector": result.next_selector,
+        "errors": result.errors,
+        "elapsed_ms": result.elapsed_ms,
+        "pages": [
+            {"page": p["page"], "title": p["data"].get("title", ""),
+             "text_length": len(p["data"].get("text", "")),
+             "structured": p["data"].get("structured", {})}
+            for p in result.pages
+        ],
+    }
+
+
+# ─── Form Fill ───
+
+class FormFillRequest(BaseModel):
+    url: str = Field(..., description="目标 URL")
+    form_index: int = Field(default=0, description="表单序号")
+    custom_fields: Optional[Dict[str, str]] = Field(default=None, description="自定义填充值")
+    submit: bool = Field(default=True, description="是否提交")
+    wait_ms: int = Field(default=1500)
+
+class MultiStepRequest(BaseModel):
+    url: str = Field(..., description="表单向导起始 URL")
+    steps_data: List[Dict[str, str]] = Field(default=[], description="每步的填充数据")
+    max_steps: int = Field(default=5)
+
+@router.post("/fill-form")
+async def fill_form(req: FormFillRequest):
+    """智能识别并填充表单
+    
+    Agent 视角：给一个 URL，自动检测表单，根据字段名智能填充，可选提交。
+    支持：text/select/checkbox/radio/textarea。
+    """
+    renderer = await get_renderer()
+    engine = FormEngine()
+    result = await engine.fill_and_submit(
+        renderer, req.url, req.form_index, req.custom_fields, req.submit
+    )
+    return {
+        "success": not bool(result.error),
+        "url": req.url,
+        "form_id": result.form_id,
+        "action": result.action,
+        "method": result.method,
+        "fields_detected": len(result.fields),
+        "fields_filled": result.filled,
+        "submitted": result.submitted,
+        "response_title": result.response_title,
+        "response_text": result.response_text[:500] if result.response_text else "",
+        "error": result.error,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+@router.post("/multi-step")
+async def multi_step_form(req: MultiStepRequest):
+    """多步表单向导 — 自动填充多页表单
+    
+    Agent 视角：注册向导、购物结账等多步流程。
+    """
+    renderer = await get_renderer()
+    engine = FormEngine()
+    result = await engine.multi_step_wizard(
+        renderer, req.url, req.steps_data, req.max_steps
+    )
+    return {
+        "success": result.completed,
+        "url": req.url,
+        "total_steps": result.total_steps,
+        "completed": result.completed,
+        "final_url": result.final_url,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+# ─── Login / Session ───
+
+class LoginRequest(BaseModel):
+    login_url: str = Field(..., description="登录页 URL")
+    username: str = Field(..., description="用户名/邮箱")
+    password: str = Field(..., description="密码")
+    custom_fields: Optional[Dict[str, str]] = Field(default=None, description="额外字段（验证码等）")
+
+class LoginCheckRequest(BaseModel):
+    url: str = Field(..., description="检测页面 URL")
+
+@router.post("/login")
+async def login_to_site(req: LoginRequest):
+    """自动登录 + Session 持久化
+    
+    Agent 视角：给定登录页 URL + 凭证，自动检测登录表单、填充、提交，
+    保存 Cookie 为 Session 供后续请求使用。
+    """
+    renderer = await get_renderer()
+    engine = LoginEngine()
+    result = await engine.login(
+        renderer, req.login_url, req.username, req.password, req.custom_fields
+    )
+    return {
+        "success": result.success,
+        "login_url": req.login_url,
+        "detection_method": result.detection_method,
+        "filled_fields": {k: ("***" if "password" in k.lower() else v) for k, v in result.filled_fields.items()},
+        "cookies_count": result.cookies_count,
+        "session_id": result.session_id,
+        "redirect_url": result.redirect_url,
+        "response_title": result.response_title,
+        "error": result.error,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+@router.get("/sessions")
+async def list_sessions():
+    """列出所有已保存的 Session"""
+    engine = LoginEngine()
+    sessions = engine.list_sessions()
+    return {"sessions": sessions, "count": len(sessions)}
+
+@router.post("/login-check")
+async def check_login_needed(req: LoginCheckRequest):
+    """检测页面是否需要登录"""
+    renderer = await get_renderer()
+    engine = LoginEngine()
+    login_form = await engine.detect_login_form(renderer, req.url)
+    return {
+        "url": req.url,
+        "login_required": login_form is not None,
+        "login_form_detected": login_form is not None,
+        "username_field": login_form.get("username_field", {}).get("name") if login_form else None,
+        "form_action": login_form.get("form_action") if login_form else None,
+    }
+
+
+@router.post("/capture")
+async def capture_media(req: CaptureRequest):
+    """抓取页面的多媒体资源（图片、视频、截图）"""
+    renderer = await get_renderer()
+    page = await renderer.render(req.url, screenshot=True, extract_images=True)
+    
+    from dataclasses import asdict
+    data = asdict(page)
+    
+    return {
+        "success": not bool(page.error),
+        "url": req.url,
+        "title": page.title,
+        "images": data.get("images", [])[:20],
+        "videos": data.get("videos", []),
+        "screenshot": data.get("screenshot_path", ""),
+        "og_image": data.get("og_image", ""),
+        "favicon": data.get("favicon", ""),
+    }
