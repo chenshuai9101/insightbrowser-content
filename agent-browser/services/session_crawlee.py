@@ -1,1 +1,102 @@
-"\"\"\"Agent Browser \u2014 Session Pool + Login Engine (Crawlee 1.6.3 \u9a71\u52a8)\n\n\u57fa\u4e8e Crawlee SessionPool\uff1a\n- \u81ea\u52a8 Cookie/Session \u7ba1\u7406\n- \u667a\u80fd\u767b\u5f55\u8868\u5355\u68c0\u6d4b + \u63d0\u4ea4\n- \u6709 legacy fallback\n\"\"\"\nfrom typing import Optional, Dict, Any, List\nfrom dataclasses import dataclass, field\nimport logging\n\nlogger = logging.getLogger(\"agent-browser.sessions\")\n\n@dataclass\nclass LoginResult:\n    url: str\n    success: bool = False\n    session_id: str = \"\"\n    cookies_count: int = 0\n    error: str = \"\"\n    elapsed_ms: float = 0\n\nclass SessionPoolEngine:\n    \"\"\"Crawlee SessionPool \u5c01\u88c5\"\"\"\n\n    async def login(self, login_url: str, username: str, password: str) -> LoginResult:\n        import time\n        start = time.time()\n        result = LoginResult(url=login_url)\n\n        try:\n            from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext\n            from crawlee.sessions import SessionPool\n\n            pool = SessionPool(max_pool_size=1)\n            session = await pool.get_session()\n            login_done = False\n            cookies_count = 0\n\n            crawler = PlaywrightCrawler(\n                max_requests_per_crawl=1,\n                headless=True,\n                session_pool=pool,\n            )\n\n            @crawler.request_handler\n            async def handler(context: PlaywrightCrawlingContext) -> None:\n                nonlocal login_done, cookies_count\n                page = context.page\n                await page.goto(login_url, wait_until=\"networkidle\", timeout=30000)\n                await page.wait_for_timeout(1500)\n\n                # \u68c0\u6d4b\u7528\u6237\u540d + \u5bc6\u7801\u5b57\u6bb5\n                username_sel = await page.evaluate(\"\"\"() => {\n                    const keywords = ['username','user','email','login','account','phone','mobile'];\n                    for (const el of document.querySelectorAll('input:not([type=\"hidden\"])')) {\n                        const n = (el.name || el.id || '').toLowerCase();\n                        if (keywords.some(k => n.includes(k))) return el.name || el.id;\n                    }\n                    return '';\n                }\"\"\")\n                pwd_el = await page.query_selector(\"input[type='password']\")\n\n                if username_sel and pwd_el:\n                    await page.fill(f\"[name='{username_sel}']\", username)\n                    pwd_name = await pwd_el.get_attribute(\"name\") or \"\"\n                    await page.fill(f\"[name='{pwd_name}']\", password)\n                    try:\n                        await page.click(\"button[type='submit'], input[type='submit']\")\n                    except:\n                        await page.evaluate(\"document.forms[0].submit()\")\n                    await page.wait_for_load_state(\"networkidle\", timeout=10000)\n                    login_done = True\n                    cookies = await context.page.context.cookies()\n                    cookies_count = len(cookies)\n\n            await crawler.run([login_url])\n            await crawler.close()\n\n            if login_done:\n                result.success = True\n                result.session_id = session.id if session else \"\"\n                result.cookies_count = cookies_count\n            else:\n                result.error = \"No login form detected\"\n\n        except Exception as e:\n            # Fallback to legacy\n            try:\n                from services.login import LoginEngine\n                from services.renderer import get_renderer\n                renderer = await get_renderer()\n                engine = LoginEngine()\n                legacy_result = await engine.login(renderer, login_url, username, password)\n                result.success = legacy_result.success\n                result.session_id = legacy_result.session_id\n                result.cookies_count = legacy_result.cookies_count\n            except Exception as e2:\n                result.error = f\"Crawlee: {str(e)[:100]} | Legacy: {str(e2)[:100]}\"\n\n        result.elapsed_ms = (time.time() - start) * 1000\n        return result\n"
+"""Agent Browser — Session Pool + Login Engine (Crawlee 1.6.3 驱动)
+
+基于 Crawlee SessionPool：
+- 自动 Cookie/Session 管理
+- 智能登录表单检测 + 提交
+- 有 legacy fallback
+"""
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger("agent-browser.sessions")
+
+@dataclass
+class LoginResult:
+    url: str
+    success: bool = False
+    session_id: str = ""
+    cookies_count: int = 0
+    error: str = ""
+    elapsed_ms: float = 0
+
+class SessionPoolEngine:
+    """Crawlee SessionPool 封装"""
+
+    async def login(self, login_url: str, username: str, password: str) -> LoginResult:
+        import time
+        start = time.time()
+        result = LoginResult(url=login_url)
+
+        try:
+            from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+            from crawlee.sessions import SessionPool
+
+            pool = SessionPool(max_pool_size=1)
+            session = await pool.get_session()
+            login_done = False
+            cookies_count = 0
+
+            crawler = PlaywrightCrawler(
+                max_requests_per_crawl=1,
+                headless=True,
+                session_pool=pool,
+            )
+
+            @crawler.request_handler
+            async def handler(context: PlaywrightCrawlingContext) -> None:
+                nonlocal login_done, cookies_count
+                page = context.page
+                await page.goto(login_url, wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(1500)
+
+                # 检测用户名 + 密码字段
+                username_sel = await page.evaluate("""() => {
+                    const keywords = ['username','user','email','login','account','phone','mobile'];
+                    for (const el of document.querySelectorAll('input:not([type="hidden"])')) {
+                        const n = (el.name || el.id || '').toLowerCase();
+                        if (keywords.some(k => n.includes(k))) return el.name || el.id;
+                    }
+                    return '';
+                }""")
+                pwd_el = await page.query_selector("input[type='password']")
+
+                if username_sel and pwd_el:
+                    await page.fill(f"[name='{username_sel}']", username)
+                    pwd_name = await pwd_el.get_attribute("name") or ""
+                    await page.fill(f"[name='{pwd_name}']", password)
+                    try:
+                        await page.click("button[type='submit'], input[type='submit']")
+                    except:
+                        await page.evaluate("document.forms[0].submit()")
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    login_done = True
+                    cookies = await context.page.context.cookies()
+                    cookies_count = len(cookies)
+
+            await crawler.run([login_url])
+            await crawler.close()
+
+            if login_done:
+                result.success = True
+                result.session_id = session.id if session else ""
+                result.cookies_count = cookies_count
+            else:
+                result.error = "No login form detected"
+
+        except Exception as e:
+            # Fallback to legacy
+            try:
+                from services.login import LoginEngine
+                from services.renderer import get_renderer
+                renderer = await get_renderer()
+                engine = LoginEngine()
+                legacy_result = await engine.login(renderer, login_url, username, password)
+                result.success = legacy_result.success
+                result.session_id = legacy_result.session_id
+                result.cookies_count = legacy_result.cookies_count
+            except Exception as e2:
+                result.error = f"Crawlee: {str(e)[:100]} | Legacy: {str(e2)[:100]}"
+
+        result.elapsed_ms = (time.time() - start) * 1000
+        return result
