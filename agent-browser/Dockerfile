@@ -1,1 +1,17 @@
-"FROM python:3.14-slim\n\nWORKDIR /app\n\n# \u5b89\u88c5 Playwright + Crawlee + FastAPI\nRUN pip install --no-cache-dir playwright \\\n    && playwright install chromium --with-deps \\\n    && pip install --no-cache-dir 'crawlee[playwright]' \\\n    && pip install --no-cache-dir fastapi uvicorn pydantic httpx\n\nCOPY main.py .\nCOPY routes/ routes/\nCOPY services/ services/\n\nEXPOSE 7022\nENV PORT=7022\nCMD [\"uvicorn\", \"main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"7022\"]\n"
+FROM python:3.14-slim
+
+WORKDIR /app
+
+# Install Playwright + Crawlee + FastAPI
+RUN pip install --no-cache-dir playwright \
+    && playwright install chromium --with-deps \
+    && pip install --no-cache-dir 'crawlee[playwright]' \
+    && pip install --no-cache-dir fastapi uvicorn pydantic httpx
+
+COPY main.py .
+COPY routes/ routes/
+COPY services/ services/
+
+EXPOSE 7022
+ENV PORT=7022
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7022"]
