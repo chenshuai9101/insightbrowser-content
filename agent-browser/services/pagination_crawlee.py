@@ -1,1 +1,91 @@
-"\"\"\"Agent Browser \u2014 Pagination Engine (Crawlee \u9a71\u52a8)\n\n\u57fa\u4e8e Crawlee 1.6.3 \u7684 enqueue_links + PlaywrightCrawler\uff1a\n- \u81ea\u52a8\u68c0\u6d4b\"\u4e0b\u4e00\u9875\"\u94fe\u63a5\u5e76\u5165\u961f\n- \u652f\u6301 URL pattern \u7ffb\u9875\n- \u540c\u57df\u9650\u5236 + \u6700\u5927\u9875\u9762\u6570\n\"\"\"\nfrom typing import Optional, List, Dict, Any\nfrom dataclasses import dataclass, field\nimport logging\n\nlogger = logging.getLogger(\"agent-browser.pagination\")\n\n@dataclass\nclass PaginationResult:\n    url: str\n    total_pages: int = 0\n    pages: List[Dict[str, Any]] = field(default_factory=list)\n    errors: List[str] = field(default_factory=list)\n    pagination_type: str = \"crawlee_enqueue_links\"\n    elapsed_ms: float = 0\n\nclass PaginationEngine:\n    \"\"\"\u57fa\u4e8e Crawlee \u7684\u7ffb\u9875\u5f15\u64ce\"\"\"\n\n    async def paginate(self, url: str, max_pages: int = 10) -> PaginationResult:\n        \"\"\"\u4f7f\u7528 Crawlee PlaywrightCrawler \u81ea\u52a8\u7ffb\u9875\"\"\"\n        import time\n        start = time.time()\n        result = PaginationResult(url=url)\n        pages_data = []\n\n        try:\n            from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext\n            from crawlee import EnqueueStrategy\n\n            crawler = PlaywrightCrawler(\n                max_requests_per_crawl=max_pages,\n                headless=True,\n                request_handler_timeout_secs=30,\n            )\n\n            @crawler.request_handler\n            async def handler(context: PlaywrightCrawlingContext) -> None:\n                title = await context.page.title()\n                text = await context.page.evaluate(\n                    \"() => document.body?.innerText?.substring(0, 10000) || ''\"\n                )\n                pages_data.append({\n                    \"page\": len(pages_data) + 1,\n                    \"url\": context.request.loaded_url or context.request.url,\n                    \"title\": title,\n                    \"text\": text,\n                })\n\n                # Crawlee \u81ea\u52a8\u53d1\u73b0\u5e76 enqueue \"\u4e0b\u4e00\u9875\" \u94fe\u63a5\n                await context.enqueue_links(\n                    strategy=EnqueueStrategy.SAME_DOMAIN,\n                    label=\"NEXT_PAGE\",\n                )\n\n            await crawler.run([url])\n            await crawler.close()\n\n        except Exception as e:\n            result.errors.append(f\"Crawlee pagination failed: {str(e)[:300]}\")\n            logger.error(f\"Crawlee pagination error: {e}\")\n\n            # Fallback: \u7528 legacy \u7248\u672c\n            try:\n                from services.pagination_legacy import PaginationEngine as LegacyEngine\n                from services.renderer import get_renderer\n                renderer = await get_renderer()\n                engine = LegacyEngine()\n                from dataclasses import asdict\n                page = await renderer.render(url=url)\n                legacy_result = await engine.paginate(renderer, url, asdict(page), max_pages)\n                pages_data = [\n                    {\"page\": p[\"page\"], \"url\": p[\"data\"].get(\"url\", url),\n                     \"title\": p[\"data\"].get(\"title\", \"\"),\n                     \"text\": p[\"data\"].get(\"text\", \"\")}\n                    for p in legacy_result.pages\n                ]\n                result.pagination_type = \"legacy_fallback\"\n            except Exception as e2:\n                result.errors.append(f\"Legacy fallback also failed: {str(e2)[:200]}\")\n\n        result.pages = pages_data\n        result.total_pages = len(pages_data)\n        result.elapsed_ms = (time.time() - start) * 1000\n        return result\n"
+"""Agent Browser — Pagination Engine (Crawlee 驱动)
+
+基于 Crawlee 1.6.3 的 enqueue_links + PlaywrightCrawler：
+- 自动检测"下一页"链接并入队
+- 支持 URL pattern 翻页
+- 同域限制 + 最大页面数
+"""
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger("agent-browser.pagination")
+
+@dataclass
+class PaginationResult:
+    url: str
+    total_pages: int = 0
+    pages: List[Dict[str, Any]] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    pagination_type: str = "crawlee_enqueue_links"
+    elapsed_ms: float = 0
+
+class PaginationEngine:
+    """基于 Crawlee 的翻页引擎"""
+
+    async def paginate(self, url: str, max_pages: int = 10) -> PaginationResult:
+        """使用 Crawlee PlaywrightCrawler 自动翻页"""
+        import time
+        start = time.time()
+        result = PaginationResult(url=url)
+        pages_data = []
+
+        try:
+            from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+            from crawlee import EnqueueStrategy
+
+            crawler = PlaywrightCrawler(
+                max_requests_per_crawl=max_pages,
+                headless=True,
+                request_handler_timeout_secs=30,
+            )
+
+            @crawler.request_handler
+            async def handler(context: PlaywrightCrawlingContext) -> None:
+                title = await context.page.title()
+                text = await context.page.evaluate(
+                    "() => document.body?.innerText?.substring(0, 10000) || ''"
+                )
+                pages_data.append({
+                    "page": len(pages_data) + 1,
+                    "url": context.request.loaded_url or context.request.url,
+                    "title": title,
+                    "text": text,
+                })
+
+                # Crawlee 自动发现并 enqueue "下一页" 链接
+                await context.enqueue_links(
+                    strategy=EnqueueStrategy.SAME_DOMAIN,
+                    label="NEXT_PAGE",
+                )
+
+            await crawler.run([url])
+            await crawler.close()
+
+        except Exception as e:
+            result.errors.append(f"Crawlee pagination failed: {str(e)[:300]}")
+            logger.error(f"Crawlee pagination error: {e}")
+
+            # Fallback: 用 legacy 版本
+            try:
+                from services.pagination_legacy import PaginationEngine as LegacyEngine
+                from services.renderer import get_renderer
+                renderer = await get_renderer()
+                engine = LegacyEngine()
+                from dataclasses import asdict
+                page = await renderer.render(url=url)
+                legacy_result = await engine.paginate(renderer, url, asdict(page), max_pages)
+                pages_data = [
+                    {"page": p["page"], "url": p["data"].get("url", url),
+                     "title": p["data"].get("title", ""),
+                     "text": p["data"].get("text", "")}
+                    for p in legacy_result.pages
+                ]
+                result.pagination_type = "legacy_fallback"
+            except Exception as e2:
+                result.errors.append(f"Legacy fallback also failed: {str(e2)[:200]}")
+
+        result.pages = pages_data
+        result.total_pages = len(pages_data)
+        result.elapsed_ms = (time.time() - start) * 1000
+        return result
