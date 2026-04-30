@@ -1,1 +1,332 @@
-"\"\"\"Agent Browser \u2014 Login & Session Management Engine\n\n\u4e3a Agent \u63d0\u4f9b\u767b\u5f55\u80fd\u529b\uff1a\n- \u81ea\u52a8\u68c0\u6d4b\u767b\u5f55\u8868\u5355\n- \u667a\u80fd\u586b\u5145\u51ed\u8bc1\n- Cookie/Session \u6301\u4e45\u5316\n- \u767b\u5f55\u72b6\u6001\u68c0\u6d4b\n- OAuth/Social \u767b\u5f55\u652f\u6301\uff08\u57fa\u7840\uff09\n\"\"\"\nimport logging\nimport time\nimport json\nimport os\nfrom typing import Optional, Dict, Any, List\nfrom dataclasses import dataclass, field\n\nlogger = logging.getLogger(\"agent-browser.login\")\n\n@dataclass\nclass LoginResult:\n    url: str\n    success: bool = False\n    detection_method: str = \"unknown\"  # form_detection, cookie_check, url_check\n    form_fields: List[Dict[str, str]] = field(default_factory=list)\n    filled_fields: Dict[str, str] = field(default_factory=dict)\n    cookies_count: int = 0\n    session_id: str = \"\"\n    redirect_url: str = \"\"\n    response_title: str = \"\"\n    error: str = \"\"\n    elapsed_ms: float = 0\n\nclass LoginEngine:\n    \"\"\"Agent \u767b\u5f55\u5f15\u64ce\"\"\"\n\n    # \u5e38\u89c1\u767b\u5f55\u76f8\u5173\u5173\u952e\u8bcd\n    LOGIN_KEYWORDS = [\n        \"login\", \"signin\", \"log in\", \"sign in\", \"\u767b\u5f55\", \"\u767b\u5165\",\n    ]\n\n    # \u5e38\u89c1\u7528\u6237\u540d/\u5bc6\u7801\u5b57\u6bb5\u540d\n    USERNAME_NAMES = [\n        \"username\", \"user\", \"email\", \"login\", \"account\", \"phone\", \"mobile\",\n        \"userid\", \"user_id\", \"login_name\", \"loginname\", \"\u540d\u79f0\", \"\u624b\u673a\u53f7\",\n    ]\n    PASSWORD_NAMES = [\n        \"password\", \"pass\", \"passwd\", \"pwd\", \"pin\", \"secret\", \"\u5bc6\u7801\",\n    ]\n\n    # \u767b\u5f55\u6210\u529f\u6307\u793a\u5668\n    SUCCESS_INDICATORS = [\n        \"logout\", \"sign out\", \"\u9000\u51fa\", \"\u767b\u51fa\", \"my account\", \"\u4e2a\u4eba\u4e2d\u5fc3\",\n        \"dashboard\", \"profile\", \"settings\", \"welcome\", \"\u6b22\u8fce\",\n    ]\n\n    def __init__(self, session_dir: str = \"/tmp/agent_browser_sessions\"):\n        self.session_dir = session_dir\n        os.makedirs(session_dir, exist_ok=True)\n\n    async def detect_login_form(self, renderer, url: str) -> Optional[dict]:\n        \"\"\"\u68c0\u6d4b\u9875\u9762\u4e0a\u7684\u767b\u5f55\u8868\u5355\"\"\"\n        page = await renderer.render(url, wait_ms=1500, extract_forms=True)\n        from dataclasses import asdict\n        page_data = asdict(page)\n\n        forms = page_data.get(\"forms\", [])\n        if not forms:\n            return None\n\n        for form in forms:\n            inputs = form.get(\"inputs\", [])\n            input_names = [inp.get(\"name\", \"\").lower() for inp in inputs]\n            input_types = [inp.get(\"type\", \"\").lower() for inp in inputs]\n\n            # \u68c0\u6d4b\u662f\u5426\u4e3a\u767b\u5f55\u8868\u5355\n            has_username = any(\n                any(un in name for un in self.USERNAME_NAMES)\n                for name in input_names\n            )\n            has_password = \"password\" in input_types\n\n            if has_username and has_password:\n                return {\n                    \"form_action\": form.get(\"action\", url),\n                    \"form_method\": form.get(\"method\", \"post\"),\n                    \"form_id\": form.get(\"id\", \"\"),\n                    \"username_field\": next(\n                        (inp for inp in inputs if any(un in inp.get(\"name\", \"\").lower() for un in self.USERNAME_NAMES)),\n                        None\n                    ),\n                    \"password_field\": next(\n                        (inp for inp in inputs if inp.get(\"type\") == \"password\"),\n                        None\n                    ),\n                    \"all_inputs\": inputs,\n                }\n\n        return None\n\n    async def login(self, renderer, login_url: str,\n                    username: str, password: str,\n                    custom_fields: Optional[Dict[str, str]] = None) -> LoginResult:\n        \"\"\"\u6267\u884c\u767b\u5f55\n\n        Args:\n            renderer: AgentRenderer \u5b9e\u4f8b\n            login_url: \u767b\u5f55\u9875 URL\n            username: \u7528\u6237\u540d\n            password: \u5bc6\u7801\n            custom_fields: \u989d\u5916\u586b\u5145\uff08\u5982\u9a8c\u8bc1\u7801/2FA\uff09\n        \"\"\"\n        start = time.time()\n        result = LoginResult(url=login_url)\n\n        try:\n            await renderer._ensure_browser()\n            context = await renderer._browser.new_context(\n                viewport={\"width\": 1440, \"height\": 900},\n                user_agent=\"InsightBrowser/2.0 (AgentBrowser; +https://insightbrowser.app)\"\n            )\n            page = await context.new_page()\n            await page.goto(login_url, wait_until=\"networkidle\", timeout=30000)\n            await page.wait_for_timeout(1500)\n\n            # Step 1: \u68c0\u6d4b\u767b\u5f55\u8868\u5355\n            login_form = await self._detect_form_in_page(page)\n            if not login_form:\n                # \u53ef\u80fd\u5df2\u7ecf\u767b\u5f55\n                if await self._check_logged_in(page):\n                    result.success = True\n                    result.detection_method = \"already_logged_in\"\n                    cookies = await context.cookies()\n                    result.cookies_count = len(cookies)\n                    result.response_title = await page.title()\n                    result.redirect_url = page.url\n                    await context.close()\n                    result.elapsed_ms = (time.time() - start) * 1000\n                    return result\n\n                result.error = \"No login form detected on page\"\n                await context.close()\n                result.elapsed_ms = (time.time() - start) * 1000\n                return result\n\n            result.form_fields = login_form.get(\"all_inputs\", [])\n            result.detection_method = \"form_detection\"\n\n            # Step 2: \u586b\u5145\u7528\u6237\u540d\n            uname_field = login_form[\"username_field\"]\n            if uname_field:\n                uname_name = uname_field[\"name\"]\n                await page.fill(f\"[name='{uname_name}']\", username)\n                result.filled_fields[uname_name] = username\n\n            # Step 3: \u586b\u5145\u5bc6\u7801\n            pwd_field = login_form[\"password_field\"]\n            if pwd_field:\n                pwd_name = pwd_field[\"name\"]\n                await page.fill(f\"[name='{pwd_name}']\", password)\n                result.filled_fields[pwd_name] = \"***\"\n\n            # Step 4: \u586b\u5145\u81ea\u5b9a\u4e49\u5b57\u6bb5\n            if custom_fields:\n                for name, value in custom_fields.items():\n                    try:\n                        await page.fill(f\"[name='{name}']\", value)\n                        result.filled_fields[name] = value\n                    except:\n                        pass\n\n            # Step 5: \u63d0\u4ea4\n            try:\n                await page.click(\"button[type='submit'], input[type='submit']\")\n            except:\n                # JS submit\n                await page.evaluate(\"document.forms[0].submit()\")\n\n            await page.wait_for_load_state(\"networkidle\", timeout=15000)\n            await page.wait_for_timeout(2000)\n\n            # Step 6: \u9a8c\u8bc1\u767b\u5f55\u7ed3\u679c\n            logged_in = await self._check_logged_in(page)\n\n            if logged_in:\n                result.success = True\n                result.redirect_url = page.url\n                result.response_title = await page.title()\n\n                # \u4fdd\u5b58 session\n                cookies = await context.cookies()\n                result.cookies_count = len(cookies)\n                result.session_id = self._save_session(login_url, cookies)\n            else:\n                result.error = \"Login form submitted but login not detected. Check credentials.\"\n                result.response_title = await page.title()\n\n            await context.close()\n\n        except Exception as e:\n            result.error = str(e)[:300]\n            logger.error(f\"Login error for {login_url}: {e}\")\n\n        result.elapsed_ms = (time.time() - start) * 1000\n        return result\n\n    async def login_with_session(self, renderer, url: str, session_id: str) -> Optional[dict]:\n        \"\"\"\u4f7f\u7528\u5df2\u4fdd\u5b58\u7684 session \u8bbf\u95ee\u9875\u9762\"\"\"\n        cookies = self._load_session(session_id)\n        if not cookies:\n            return None\n\n        await renderer._ensure_browser()\n        context = await renderer._browser.new_context(\n            viewport={\"width\": 1440, \"height\": 900},\n            user_agent=\"InsightBrowser/2.0 (AgentBrowser)\"\n        )\n        await context.add_cookies(cookies)\n        page = await context.new_page()\n        await page.goto(url, wait_until=\"networkidle\", timeout=30000)\n        await page.wait_for_timeout(1000)\n\n        logged_in = await self._check_logged_in(page)\n        title = await page.title()\n\n        await context.close()\n\n        return {\n            \"logged_in\": logged_in,\n            \"title\": title,\n            \"session_valid\": logged_in,\n        }\n\n    async def _detect_form_in_page(self, page) -> Optional[dict]:\n        \"\"\"\u5728\u9875\u9762\u4e2d\u68c0\u6d4b\u767b\u5f55\u8868\u5355\"\"\"\n        forms = await page.evaluate(\"\"\"() => {\n            return [...document.querySelectorAll('form')].map(f => ({\n                id: f.id || '',\n                action: f.action || window.location.href,\n                method: (f.method || 'get').toLowerCase(),\n                inputs: [...f.querySelectorAll('input:not([type=\"hidden\"]), select, textarea')]\n                    .slice(0, 20).map(el => ({\n                        name: el.name || el.id || '',\n                        type: el.type || el.tagName.toLowerCase(),\n                        placeholder: (el.placeholder || '').substring(0, 100),\n                        required: !!el.required,\n                        tag: el.tagName.toLowerCase()\n                    }))\n            })).filter(f => f.inputs.length > 0);\n        }\"\"\")\n\n        uname_names = self.USERNAME_NAMES\n\n        for form in forms:\n            inputs = form[\"inputs\"]\n            input_names = [inp[\"name\"].lower() for inp in inputs]\n            input_types = [inp[\"type\"] for inp in inputs]\n\n            has_username = any(\n                any(un in name for un in uname_names)\n                for name in input_names\n            )\n            has_password = \"password\" in input_types\n\n            if has_username and has_password:\n                return {\n                    \"form_action\": form[\"action\"],\n                    \"form_method\": form[\"method\"],\n                    \"form_id\": form[\"id\"],\n                    \"username_field\": next(\n                        (inp for inp in inputs if any(un in inp[\"name\"].lower() for un in uname_names)),\n                        None\n                    ),\n                    \"password_field\": next(\n                        (inp for inp in inputs if inp[\"type\"] == \"password\"),\n                        None\n                    ),\n                    \"all_inputs\": inputs,\n                }\n\n        return None\n\n    async def _check_logged_in(self, page) -> bool:\n        \"\"\"\u68c0\u6d4b\u662f\u5426\u5df2\u767b\u5f55\"\"\"\n        text = (await page.evaluate(\n            \"() => document.body?.innerText?.substring(0, 2000) || ''\"\n        )).lower()\n\n        for indicator in self.SUCCESS_INDICATORS:\n            if indicator.lower() in text:\n                return True\n\n        return False\n\n    def _save_session(self, url: str, cookies: List[dict]) -> str:\n        \"\"\"\u4fdd\u5b58 session cookies \u5230\u6587\u4ef6\"\"\"\n        import hashlib\n        from urllib.parse import urlparse\n\n        domain = urlparse(url).netloc.replace(\".\", \"_\")\n        sid = f\"{domain}_{hashlib.md5(url.encode()).hexdigest()[:8]}\"\n        path = os.path.join(self.session_dir, f\"{sid}.json\")\n\n        with open(path, \"w\") as f:\n            json.dump({\"url\": url, \"domain\": domain, \"cookies\": cookies}, f, indent=2)\n\n        logger.info(f\"Session saved: {sid} ({len(cookies)} cookies)\")\n        return sid\n\n    def _load_session(self, session_id: str) -> Optional[List[dict]]:\n        \"\"\"\u52a0\u8f7d\u4fdd\u5b58\u7684 session cookies\"\"\"\n        path = os.path.join(self.session_dir, f\"{session_id}.json\")\n        if not os.path.exists(path):\n            return None\n        with open(path) as f:\n            data = json.load(f)\n        return data.get(\"cookies\", [])\n\n    def list_sessions(self) -> List[dict]:\n        \"\"\"\u5217\u51fa\u6240\u6709\u4fdd\u5b58\u7684 session\"\"\"\n        sessions = []\n        for fname in os.listdir(self.session_dir):\n            if fname.endswith(\".json\"):\n                path = os.path.join(self.session_dir, fname)\n                with open(path) as f:\n                    data = json.load(f)\n                sessions.append({\n                    \"session_id\": fname.replace(\".json\", \"\"),\n                    \"url\": data.get(\"url\", \"\"),\n                    \"domain\": data.get(\"domain\", \"\"),\n                    \"cookies_count\": len(data.get(\"cookies\", [])),\n                })\n        return sessions\n"
+"""Agent Browser — Login & Session Management Engine
+
+为 Agent 提供登录能力：
+- 自动检测登录表单
+- 智能填充凭证
+- Cookie/Session 持久化
+- 登录状态检测
+- OAuth/Social 登录支持（基础）
+"""
+import logging
+import time
+import json
+import os
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+
+logger = logging.getLogger("agent-browser.login")
+
+@dataclass
+class LoginResult:
+    url: str
+    success: bool = False
+    detection_method: str = "unknown"  # form_detection, cookie_check, url_check
+    form_fields: List[Dict[str, str]] = field(default_factory=list)
+    filled_fields: Dict[str, str] = field(default_factory=dict)
+    cookies_count: int = 0
+    session_id: str = ""
+    redirect_url: str = ""
+    response_title: str = ""
+    error: str = ""
+    elapsed_ms: float = 0
+
+class LoginEngine:
+    """Agent 登录引擎"""
+
+    # 常见登录相关关键词
+    LOGIN_KEYWORDS = [
+        "login", "signin", "log in", "sign in", "登录", "登入",
+    ]
+
+    # 常见用户名/密码字段名
+    USERNAME_NAMES = [
+        "username", "user", "email", "login", "account", "phone", "mobile",
+        "userid", "user_id", "login_name", "loginname", "名称", "手机号",
+    ]
+    PASSWORD_NAMES = [
+        "password", "pass", "passwd", "pwd", "pin", "secret", "密码",
+    ]
+
+    # 登录成功指示器
+    SUCCESS_INDICATORS = [
+        "logout", "sign out", "退出", "登出", "my account", "个人中心",
+        "dashboard", "profile", "settings", "welcome", "欢迎",
+    ]
+
+    def __init__(self, session_dir: str = "/tmp/agent_browser_sessions"):
+        self.session_dir = session_dir
+        os.makedirs(session_dir, exist_ok=True)
+
+    async def detect_login_form(self, renderer, url: str) -> Optional[dict]:
+        """检测页面上的登录表单"""
+        page = await renderer.render(url, wait_ms=1500, extract_forms=True)
+        from dataclasses import asdict
+        page_data = asdict(page)
+
+        forms = page_data.get("forms", [])
+        if not forms:
+            return None
+
+        for form in forms:
+            inputs = form.get("inputs", [])
+            input_names = [inp.get("name", "").lower() for inp in inputs]
+            input_types = [inp.get("type", "").lower() for inp in inputs]
+
+            # 检测是否为登录表单
+            has_username = any(
+                any(un in name for un in self.USERNAME_NAMES)
+                for name in input_names
+            )
+            has_password = "password" in input_types
+
+            if has_username and has_password:
+                return {
+                    "form_action": form.get("action", url),
+                    "form_method": form.get("method", "post"),
+                    "form_id": form.get("id", ""),
+                    "username_field": next(
+                        (inp for inp in inputs if any(un in inp.get("name", "").lower() for un in self.USERNAME_NAMES)),
+                        None
+                    ),
+                    "password_field": next(
+                        (inp for inp in inputs if inp.get("type") == "password"),
+                        None
+                    ),
+                    "all_inputs": inputs,
+                }
+
+        return None
+
+    async def login(self, renderer, login_url: str,
+                    username: str, password: str,
+                    custom_fields: Optional[Dict[str, str]] = None) -> LoginResult:
+        """执行登录
+
+        Args:
+            renderer: AgentRenderer 实例
+            login_url: 登录页 URL
+            username: 用户名
+            password: 密码
+            custom_fields: 额外填充（如验证码/2FA）
+        """
+        start = time.time()
+        result = LoginResult(url=login_url)
+
+        try:
+            await renderer._ensure_browser()
+            context = await renderer._browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="InsightBrowser/2.0 (AgentBrowser; +https://insightbrowser.app)"
+            )
+            page = await context.new_page()
+            await page.goto(login_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(1500)
+
+            # Step 1: 检测登录表单
+            login_form = await self._detect_form_in_page(page)
+            if not login_form:
+                # 可能已经登录
+                if await self._check_logged_in(page):
+                    result.success = True
+                    result.detection_method = "already_logged_in"
+                    cookies = await context.cookies()
+                    result.cookies_count = len(cookies)
+                    result.response_title = await page.title()
+                    result.redirect_url = page.url
+                    await context.close()
+                    result.elapsed_ms = (time.time() - start) * 1000
+                    return result
+
+                result.error = "No login form detected on page"
+                await context.close()
+                result.elapsed_ms = (time.time() - start) * 1000
+                return result
+
+            result.form_fields = login_form.get("all_inputs", [])
+            result.detection_method = "form_detection"
+
+            # Step 2: 填充用户名
+            uname_field = login_form["username_field"]
+            if uname_field:
+                uname_name = uname_field["name"]
+                await page.fill(f"[name='{uname_name}']", username)
+                result.filled_fields[uname_name] = username
+
+            # Step 3: 填充密码
+            pwd_field = login_form["password_field"]
+            if pwd_field:
+                pwd_name = pwd_field["name"]
+                await page.fill(f"[name='{pwd_name}']", password)
+                result.filled_fields[pwd_name] = "***"
+
+            # Step 4: 填充自定义字段
+            if custom_fields:
+                for name, value in custom_fields.items():
+                    try:
+                        await page.fill(f"[name='{name}']", value)
+                        result.filled_fields[name] = value
+                    except:
+                        pass
+
+            # Step 5: 提交
+            try:
+                await page.click("button[type='submit'], input[type='submit']")
+            except:
+                # JS submit
+                await page.evaluate("document.forms[0].submit()")
+
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_timeout(2000)
+
+            # Step 6: 验证登录结果
+            logged_in = await self._check_logged_in(page)
+
+            if logged_in:
+                result.success = True
+                result.redirect_url = page.url
+                result.response_title = await page.title()
+
+                # 保存 session
+                cookies = await context.cookies()
+                result.cookies_count = len(cookies)
+                result.session_id = self._save_session(login_url, cookies)
+            else:
+                result.error = "Login form submitted but login not detected. Check credentials."
+                result.response_title = await page.title()
+
+            await context.close()
+
+        except Exception as e:
+            result.error = str(e)[:300]
+            logger.error(f"Login error for {login_url}: {e}")
+
+        result.elapsed_ms = (time.time() - start) * 1000
+        return result
+
+    async def login_with_session(self, renderer, url: str, session_id: str) -> Optional[dict]:
+        """使用已保存的 session 访问页面"""
+        cookies = self._load_session(session_id)
+        if not cookies:
+            return None
+
+        await renderer._ensure_browser()
+        context = await renderer._browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent="InsightBrowser/2.0 (AgentBrowser)"
+        )
+        await context.add_cookies(cookies)
+        page = await context.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(1000)
+
+        logged_in = await self._check_logged_in(page)
+        title = await page.title()
+
+        await context.close()
+
+        return {
+            "logged_in": logged_in,
+            "title": title,
+            "session_valid": logged_in,
+        }
+
+    async def _detect_form_in_page(self, page) -> Optional[dict]:
+        """在页面中检测登录表单"""
+        forms = await page.evaluate("""() => {
+            return [...document.querySelectorAll('form')].map(f => ({
+                id: f.id || '',
+                action: f.action || window.location.href,
+                method: (f.method || 'get').toLowerCase(),
+                inputs: [...f.querySelectorAll('input:not([type="hidden"]), select, textarea')]
+                    .slice(0, 20).map(el => ({
+                        name: el.name || el.id || '',
+                        type: el.type || el.tagName.toLowerCase(),
+                        placeholder: (el.placeholder || '').substring(0, 100),
+                        required: !!el.required,
+                        tag: el.tagName.toLowerCase()
+                    }))
+            })).filter(f => f.inputs.length > 0);
+        }""")
+
+        uname_names = self.USERNAME_NAMES
+
+        for form in forms:
+            inputs = form["inputs"]
+            input_names = [inp["name"].lower() for inp in inputs]
+            input_types = [inp["type"] for inp in inputs]
+
+            has_username = any(
+                any(un in name for un in uname_names)
+                for name in input_names
+            )
+            has_password = "password" in input_types
+
+            if has_username and has_password:
+                return {
+                    "form_action": form["action"],
+                    "form_method": form["method"],
+                    "form_id": form["id"],
+                    "username_field": next(
+                        (inp for inp in inputs if any(un in inp["name"].lower() for un in uname_names)),
+                        None
+                    ),
+                    "password_field": next(
+                        (inp for inp in inputs if inp["type"] == "password"),
+                        None
+                    ),
+                    "all_inputs": inputs,
+                }
+
+        return None
+
+    async def _check_logged_in(self, page) -> bool:
+        """检测是否已登录"""
+        text = (await page.evaluate(
+            "() => document.body?.innerText?.substring(0, 2000) || ''"
+        )).lower()
+
+        for indicator in self.SUCCESS_INDICATORS:
+            if indicator.lower() in text:
+                return True
+
+        return False
+
+    def _save_session(self, url: str, cookies: List[dict]) -> str:
+        """保存 session cookies 到文件"""
+        import hashlib
+        from urllib.parse import urlparse
+
+        domain = urlparse(url).netloc.replace(".", "_")
+        sid = f"{domain}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        path = os.path.join(self.session_dir, f"{sid}.json")
+
+        with open(path, "w") as f:
+            json.dump({"url": url, "domain": domain, "cookies": cookies}, f, indent=2)
+
+        logger.info(f"Session saved: {sid} ({len(cookies)} cookies)")
+        return sid
+
+    def _load_session(self, session_id: str) -> Optional[List[dict]]:
+        """加载保存的 session cookies"""
+        path = os.path.join(self.session_dir, f"{session_id}.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("cookies", [])
+
+    def list_sessions(self) -> List[dict]:
+        """列出所有保存的 session"""
+        sessions = []
+        for fname in os.listdir(self.session_dir):
+            if fname.endswith(".json"):
+                path = os.path.join(self.session_dir, fname)
+                with open(path) as f:
+                    data = json.load(f)
+                sessions.append({
+                    "session_id": fname.replace(".json", ""),
+                    "url": data.get("url", ""),
+                    "domain": data.get("domain", ""),
+                    "cookies_count": len(data.get("cookies", [])),
+                })
+        return sessions
