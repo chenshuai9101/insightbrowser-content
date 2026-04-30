@@ -1,1 +1,117 @@
-"\"\"\"Agent \u6d4f\u89c8\u5668\u722c\u53d6\u5f15\u64ce \u2014 BFS\u9875\u9762\u6811\u904d\u5386 + \u5185\u5bb9\u63d0\u53d6\n\n\u4ece Agent \u89c6\u89d2\u8bbe\u8ba1\uff1a\n- \u8f93\u5165\u4e00\u4e2a URL\uff0c\u81ea\u52a8 BFS \u904d\u5386\u5b50\u9875\u9762\u6811\n- \u6bcf\u9875\u63d0\u53d6\u7ed3\u6784\u5316\u6570\u636e\uff08\u4e0d\u662f HTML\uff09\n- \u652f\u6301 depth \u63a7\u5236\u3001\u8282\u6d41\u3001\u53bb\u91cd\n\"\"\"\nimport asyncio\nimport logging\nfrom typing import Optional\nfrom dataclasses import dataclass, field\nfrom urllib.parse import urlparse, urljoin\n\nlogger = logging.getLogger(\"agent-browser.crawler\")\n\n@dataclass\nclass PageNode:\n    url: str\n    title: str = \"\"\n    text: str = \"\"\n    depth: int = 0\n    images_count: int = 0\n    links_count: int = 0\n    load_time_ms: float = 0\n    error: str = \"\"\n    children: list = field(default_factory=list)\n\nclass AgentCrawler:\n    \"\"\"Agent \u89c6\u89d2\u7684\u9875\u9762\u6811\u722c\u53d6\u5668\"\"\"\n    \n    def __init__(self, renderer):\n        self.renderer = renderer\n        self.visited = set()\n    \n    async def traverse(self, url: str, depth: int = 2,\n                       max_pages: int = 50, same_domain_only: bool = True) -> dict:\n        \"\"\"BFS \u904d\u5386\u9875\u9762\u6811\n        \n        Args:\n            url: \u6839 URL\n            depth: \u904d\u5386\u6df1\u5ea6\n            max_pages: \u6700\u591a\u9875\u9762\u6570\n            same_domain_only: \u662f\u5426\u53ea\u722c\u540c\u57df\n        \n        Returns:\n            {\"root\": PageNode, \"total_pages\": int, \"stats\": {...}}\n        \"\"\"\n        self.visited = set()\n        base_domain = urlparse(url).netloc\n        \n        root = await self._crawl_node(url, depth=depth, base_domain=base_domain,\n                                        max_pages=max_pages, same_domain_only=same_domain_only)\n        \n        return {\n            \"root\": root,\n            \"total_pages\": len(self.visited),\n            \"stats\": self._collect_stats(root),\n        }\n    \n    async def _crawl_node(self, url: str, depth: int, base_domain: str,\n                           max_pages: int, same_domain_only: bool) -> PageNode:\n        node = PageNode(url=url, depth=depth)\n        \n        if depth < 0 or len(self.visited) >= max_pages:\n            return node\n        \n        if url in self.visited:\n            return node\n        self.visited.add(url)\n        \n        # \u6e32\u67d3\u9875\u9762\n        try:\n            page = await self.renderer.render(url, screenshot=(depth >= 1))\n            node.title = page.title\n            node.text = page.text[:2000]\n            node.images_count = len(page.images)\n            node.links_count = len([l for l in page.links if l.get(\"internal\")])\n            node.load_time_ms = page.load_time_ms\n            node.error = page.error\n        except Exception as e:\n            node.error = str(e)[:200]\n            return node\n        \n        # \u9012\u5f52\u5b50\u9875\u9762\n        if depth > 0 and len(self.visited) < max_pages:\n            internal_links = [l for l in page.links if l.get(\"internal\")]\n            # \u53bb\u91cd + \u9650\u5236\n            for link in internal_links[:5]:\n                if link['href'] in self.visited:\n                    continue\n                if len(self.visited) >= max_pages:\n                    break\n                child = await self._crawl_node(\n                    link['href'], depth=depth-1, base_domain=base_domain,\n                    max_pages=max_pages, same_domain_only=same_domain_only\n                )\n                if child.title or child.error:\n                    node.children.append(child)\n                await asyncio.sleep(0.3)  # \u8282\u6d41\n        \n        return node\n    \n    def _collect_stats(self, node: PageNode) -> dict:\n        stats = {\"total_title\": 0, \"total_images\": 0, \"total_links\": 0, \"errors\": 0}\n        \n        def walk(n: PageNode):\n            if n.title:\n                stats[\"total_title\"] += 1\n            stats[\"total_images\"] += n.images_count\n            stats[\"total_links\"] += n.links_count\n            if n.error:\n                stats[\"errors\"] += 1\n            for c in n.children:\n                walk(c)\n        \n        walk(node)\n        return stats\n"
+"""Agent 浏览器爬取引擎 — BFS页面树遍历 + 内容提取
+
+从 Agent 视角设计：
+- 输入一个 URL，自动 BFS 遍历子页面树
+- 每页提取结构化数据（不是 HTML）
+- 支持 depth 控制、节流、去重
+"""
+import asyncio
+import logging
+from typing import Optional
+from dataclasses import dataclass, field
+from urllib.parse import urlparse, urljoin
+
+logger = logging.getLogger("agent-browser.crawler")
+
+@dataclass
+class PageNode:
+    url: str
+    title: str = ""
+    text: str = ""
+    depth: int = 0
+    images_count: int = 0
+    links_count: int = 0
+    load_time_ms: float = 0
+    error: str = ""
+    children: list = field(default_factory=list)
+
+class AgentCrawler:
+    """Agent 视角的页面树爬取器"""
+    
+    def __init__(self, renderer):
+        self.renderer = renderer
+        self.visited = set()
+    
+    async def traverse(self, url: str, depth: int = 2,
+                       max_pages: int = 50, same_domain_only: bool = True) -> dict:
+        """BFS 遍历页面树
+        
+        Args:
+            url: 根 URL
+            depth: 遍历深度
+            max_pages: 最多页面数
+            same_domain_only: 是否只爬同域
+        
+        Returns:
+            {"root": PageNode, "total_pages": int, "stats": {...}}
+        """
+        self.visited = set()
+        base_domain = urlparse(url).netloc
+        
+        root = await self._crawl_node(url, depth=depth, base_domain=base_domain,
+                                        max_pages=max_pages, same_domain_only=same_domain_only)
+        
+        return {
+            "root": root,
+            "total_pages": len(self.visited),
+            "stats": self._collect_stats(root),
+        }
+    
+    async def _crawl_node(self, url: str, depth: int, base_domain: str,
+                           max_pages: int, same_domain_only: bool) -> PageNode:
+        node = PageNode(url=url, depth=depth)
+        
+        if depth < 0 or len(self.visited) >= max_pages:
+            return node
+        
+        if url in self.visited:
+            return node
+        self.visited.add(url)
+        
+        # 渲染页面
+        try:
+            page = await self.renderer.render(url, screenshot=(depth >= 1))
+            node.title = page.title
+            node.text = page.text[:2000]
+            node.images_count = len(page.images)
+            node.links_count = len([l for l in page.links if l.get("internal")])
+            node.load_time_ms = page.load_time_ms
+            node.error = page.error
+        except Exception as e:
+            node.error = str(e)[:200]
+            return node
+        
+        # 递归子页面
+        if depth > 0 and len(self.visited) < max_pages:
+            internal_links = [l for l in page.links if l.get("internal")]
+            # 去重 + 限制
+            for link in internal_links[:5]:
+                if link['href'] in self.visited:
+                    continue
+                if len(self.visited) >= max_pages:
+                    break
+                child = await self._crawl_node(
+                    link['href'], depth=depth-1, base_domain=base_domain,
+                    max_pages=max_pages, same_domain_only=same_domain_only
+                )
+                if child.title or child.error:
+                    node.children.append(child)
+                await asyncio.sleep(0.3)  # 节流
+        
+        return node
+    
+    def _collect_stats(self, node: PageNode) -> dict:
+        stats = {"total_title": 0, "total_images": 0, "total_links": 0, "errors": 0}
+        
+        def walk(n: PageNode):
+            if n.title:
+                stats["total_title"] += 1
+            stats["total_images"] += n.images_count
+            stats["total_links"] += n.links_count
+            if n.error:
+                stats["errors"] += 1
+            for c in n.children:
+                walk(c)
+        
+        walk(node)
+        return stats
