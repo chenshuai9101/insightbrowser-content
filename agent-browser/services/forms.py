@@ -1,1 +1,378 @@
-"\"\"\"Agent Browser \u2014 Form Fill & Interaction Engine\n\n\u4e3a Agent \u63d0\u4f9b\u8868\u5355\u4ea4\u4e92\u80fd\u529b\uff1a\n- \u81ea\u52a8\u8bc6\u522b\u8868\u5355\u5b57\u6bb5\uff08input/select/textarea\uff09\n- \u667a\u80fd\u586b\u5145\uff08\u6839\u636e\u5b57\u6bb5\u540d/placeholder \u63a8\u65ad\u5185\u5bb9\uff09\n- \u8868\u5355\u63d0\u4ea4 + \u7ed3\u679c\u6293\u53d6\n- \u652f\u6301\u591a\u6b65\u8868\u5355\uff08wizard/multi-step\uff09\n- Cookie/Session \u4fdd\u6301\uff08\u540c\u4e00 context \u5185\u590d\u7528\uff09\n\"\"\"\nimport logging\nimport time\nfrom typing import Optional, List, Dict, Any\nfrom dataclasses import dataclass, field\nfrom urllib.parse import urljoin\n\nlogger = logging.getLogger(\"agent-browser.forms\")\n\n@dataclass\nclass FormField:\n    \"\"\"\u5355\u4e2a\u8868\u5355\u5b57\u6bb5\"\"\"\n    name: str\n    type: str = \"text\"\n    label: str = \"\"\n    placeholder: str = \"\"\n    required: bool = False\n    options: List[str] = field(default_factory=list)  # select options\n    value: Optional[str] = None\n\n@dataclass\nclass FormResult:\n    url: str\n    form_id: str = \"\"\n    action: str = \"\"\n    method: str = \"get\"\n    fields: List[FormField] = field(default_factory=list)\n    filled: Dict[str, str] = field(default_factory=dict)\n    submitted: bool = False\n    response_title: str = \"\"\n    response_text: str = \"\"\n    error: str = \"\"\n    elapsed_ms: float = 0\n\n@dataclass\nclass MultiStepResult:\n    url: str\n    steps: List[FormResult] = field(default_factory=list)\n    completed: bool = False\n    total_steps: int = 0\n    final_url: str = \"\"\n    elapsed_ms: float = 0\n\nclass FormEngine:\n    \"\"\"Agent \u8868\u5355\u4ea4\u4e92\u5f15\u64ce\"\"\"\n\n    # \u667a\u80fd\u5b57\u6bb5\u6620\u5c04\uff1a\u6839\u636e\u5b57\u6bb5\u540d/placeholder \u63a8\u65ad\u586b\u5145\u5185\u5bb9\n    FIELD_INFERENCE = {\n        \"q\": lambda: \"search\",\n        \"search\": lambda: \"search\",\n        \"keyword\": lambda: \"search\",\n        \"query\": lambda: \"search\",\n        \"s\": lambda: \"search\",\n        \"email\": lambda: \"agent@insightbrowser.app\",\n        \"mail\": lambda: \"agent@insightbrowser.app\",\n        \"username\": lambda: \"agent_user\",\n        \"name\": lambda: \"Agent Browser\",\n        \"firstname\": lambda: \"Agent\",\n        \"lastname\": lambda: \"Browser\",\n        \"password\": lambda: \"Test1234!\",\n        \"pass\": lambda: \"Test1234!\",\n        \"phone\": lambda: \"13800138000\",\n        \"tel\": lambda: \"13800138000\",\n        \"mobile\": lambda: \"13800138000\",\n        \"city\": lambda: \"Beijing\",\n        \"address\": lambda: \"1 Agent Street\",\n        \"zip\": lambda: \"100000\",\n        \"zipcode\": lambda: \"100000\",\n        \"postal\": lambda: \"100000\",\n        \"comment\": lambda: \"This is an automated message from Agent Browser.\",\n        \"message\": lambda: \"Automated message from Agent Browser.\",\n        \"feedback\": lambda: \"Automated feedback from Agent Browser.\",\n        \"min_price\": lambda: \"0\",\n        \"max_price\": lambda: \"999999\",\n        \"price_min\": lambda: \"0\",\n        \"price_max\": lambda: \"999999\",\n        \"budget_min\": lambda: \"0\",\n        \"budget_max\": lambda: \"999999\",\n        \"date_from\": lambda: \"2026-01-01\",\n        \"date_to\": lambda: \"2026-12-31\",\n        \"checkin\": lambda: \"2026-05-01\",\n        \"checkout\": lambda: \"2026-05-03\",\n        \"guests\": lambda: \"2\",\n        \"adults\": lambda: \"2\",\n        \"currency\": lambda: \"CNY\",\n        \"lang\": lambda: \"zh-CN\",\n        \"language\": lambda: \"Chinese\",\n        \"country\": lambda: \"China\",\n        \"agree\": lambda: \"on\",\n        \"consent\": lambda: \"on\",\n        \"subscribe\": lambda: \"on\",\n    }\n\n    async def detect_forms(self, renderer, url: str) -> List[dict]:\n        \"\"\"\u68c0\u6d4b\u9875\u9762\u6240\u6709\u8868\u5355\"\"\"\n        page = await renderer.render(url, wait_ms=1500, extract_forms=True)\n        from dataclasses import asdict\n        return asdict(page).get(\"forms\", [])\n\n    async def fill_and_submit(self, renderer, url: str,\n                              form_index: int = 0,\n                              custom_fields: Optional[Dict[str, str]] = None,\n                              submit: bool = True) -> FormResult:\n        \"\"\"\u586b\u5145\u5e76\u63d0\u4ea4\u8868\u5355\n\n        Args:\n            renderer: AgentRenderer \u5b9e\u4f8b\n            url: \u9875\u9762 URL\n            form_index: \u8868\u5355\u5e8f\u53f7\uff080-based\uff09\n            custom_fields: \u81ea\u5b9a\u4e49\u5b57\u6bb5\u503c {\"field_name\": \"value\"}\n            submit: \u662f\u5426\u63d0\u4ea4\n        \"\"\"\n        start = time.time()\n        result = FormResult(url=url)\n\n        try:\n            await renderer._ensure_browser()\n            context = await renderer._browser.new_context(\n                viewport={\"width\": 1440, \"height\": 900},\n                user_agent=\"InsightBrowser/2.0 (AgentBrowser)\"\n            )\n            page = await context.new_page()\n            await page.goto(url, wait_until=\"networkidle\", timeout=30000)\n            await page.wait_for_timeout(1000)\n\n            # Step 1: \u83b7\u53d6\u8868\u5355\u5217\u8868\n            forms = await page.evaluate(\"\"\"() => {\n                return [...document.querySelectorAll('form')].map((f, i) => ({\n                    index: i,\n                    id: f.id || '',\n                    action: f.action || window.location.href,\n                    method: (f.method || 'get').toLowerCase(),\n                    fields: [...f.querySelectorAll(\n                        'input:not([type=\"hidden\"]):not([type=\"submit\"]):not([type=\"button\"]):not([type=\"reset\"]), ' +\n                        'select, textarea'\n                    )].slice(0, 30).map(el => ({\n                        name: el.name || el.id || '',\n                        type: el.type || el.tagName.toLowerCase(),\n                        label: (() => {\n                            // try label[for]\n                            if (el.id) {\n                                const lbl = document.querySelector('label[for=\"' + el.id + '\"]');\n                                if (lbl) return lbl.textContent.trim();\n                            }\n                            // try parent label\n                            const parent = el.closest('label');\n                            if (parent) return parent.textContent.replace(el.textContent, '').trim();\n                            // try sibling label\n                            const prev = el.previousElementSibling;\n                            if (prev && prev.tagName === 'LABEL') return prev.textContent.trim();\n                            // try placeholder as fallback\n                            return el.placeholder || '';\n                        })().substring(0, 100),\n                        placeholder: (el.placeholder || '').substring(0, 100),\n                        required: !!el.required,\n                        options: el.tagName === 'SELECT' ?\n                            [...el.querySelectorAll('option')].slice(0, 50).map(o => o.value || o.textContent.trim()) : [],\n                    }))\n                })).filter(f => f.fields.length > 0);\n            }\"\"\")\n\n            if not forms or form_index >= len(forms):\n                result.error = f\"No forms found or form_index {form_index} out of range ({len(forms)} forms)\"\n                await context.close()\n                return result\n\n            target_form = forms[form_index]\n            result.form_id = target_form[\"id\"]\n            result.action = target_form[\"action\"]\n            result.method = target_form[\"method\"]\n\n            for f in target_form[\"fields\"]:\n                result.fields.append(FormField(\n                    name=f[\"name\"],\n                    type=f[\"type\"],\n                    label=f[\"label\"],\n                    placeholder=f[\"placeholder\"],\n                    required=f[\"required\"],\n                    options=f.get(\"options\", [])\n                ))\n\n            # Step 2: \u667a\u80fd\u586b\u5145\n            for field in target_form[\"fields\"]:\n                name = field[\"name\"]\n                if not name:\n                    continue\n\n                # \u4f18\u5148\u4f7f\u7528\u81ea\u5b9a\u4e49\u503c\n                if custom_fields and name in custom_fields:\n                    value = custom_fields[name]\n                else:\n                    value = self._infer_value(name, field[\"type\"], field[\"placeholder\"], field.get(\"options\", []))\n\n                if value is None:\n                    continue\n\n                result.filled[name] = value\n\n                # \u6267\u884c\u586b\u5145\n                if field[\"type\"] == \"select\" or field[\"type\"] == \"select-one\":\n                    if value in field.get(\"options\", []):\n                        await page.select_option(f\"[name='{name}']\", value)\n                elif field[\"type\"] == \"checkbox\":\n                    await page.check(f\"[name='{name}']\")\n                elif field[\"type\"] == \"radio\":\n                    await page.check(f\"[name='{name}'][value='{value}']\")\n                elif field[\"type\"] == \"textarea\":\n                    await page.fill(f\"textarea[name='{name}']\", value)\n                else:\n                    await page.fill(f\"[name='{name}']\", value)\n\n            # Step 3: \u63d0\u4ea4\n            if submit:\n                # \u70b9\u51fb\u7b2c\u4e00\u4e2a submit \u6309\u94ae\n                try:\n                    submit_btn = await page.query_selector(\n                        \"button[type='submit'], input[type='submit'], form button:last-child\"\n                    )\n                    if submit_btn:\n                        await submit_btn.click()\n                    else:\n                        # JS submit\n                        await page.evaluate(f\"document.forms[{form_index}].submit()\")\n                except Exception as e:\n                    logger.warning(f\"Submit click failed: {e}\")\n\n                await page.wait_for_load_state(\"networkidle\", timeout=15000)\n                await page.wait_for_timeout(1000)\n\n                result.submitted = True\n                result.response_title = await page.title()\n                result.response_text = await page.evaluate(\n                    \"() => document.body?.innerText?.substring(0, 5000) || ''\"\n                )\n\n            await context.close()\n\n        except Exception as e:\n            result.error = str(e)[:300]\n            logger.error(f\"Form fill error for {url}: {e}\")\n\n        result.elapsed_ms = (time.time() - start) * 1000\n        return result\n\n    def _infer_value(self, name: str, ftype: str, placeholder: str, options: list) -> Optional[str]:\n        \"\"\"\u667a\u80fd\u63a8\u65ad\u5b57\u6bb5\u503c\"\"\"\n        name_lower = name.lower().strip()\n\n        # \u7cbe\u786e\u5339\u914d\n        if name_lower in self.FIELD_INFERENCE:\n            return self.FIELD_INFERENCE[name_lower]()\n\n        # \u6a21\u7cca\u5339\u914d\n        for pattern, fn in self.FIELD_INFERENCE.items():\n            if pattern in name_lower:\n                return fn()\n\n        # \u4ece placeholder \u63a8\u65ad\n        if placeholder.lower() in self.FIELD_INFERENCE:\n            return self.FIELD_INFERENCE[placeholder.lower()]()\n\n        # Select: \u9009\u7b2c\u4e00\u4e2a\u975e\u7a7a\u9009\u9879\n        if ftype in (\"select\", \"select-one\") and options:\n            for opt in options:\n                if opt and opt not in (\"\", \"0\"):\n                    return opt\n\n        return None\n\n    async def multi_step_wizard(self, renderer, url: str,\n                                form_data: List[Dict[str, str]],\n                                max_steps: int = 5) -> MultiStepResult:\n        \"\"\"\u5904\u7406\u591a\u6b65\u8868\u5355\u5411\u5bfc\n\n        Args:\n            url: \u8d77\u59cb URL\n            form_data: \u6bcf\u4e2a\u6b65\u9aa4\u7684\u586b\u5145\u6570\u636e\n            max_steps: \u6700\u5927\u6b65\u6570\n        \"\"\"\n        start = time.time()\n        result = MultiStepResult(url=url)\n\n        try:\n            await renderer._ensure_browser()\n            context = await renderer._browser.new_context(\n                viewport={\"width\": 1440, \"height\": 900},\n                user_agent=\"InsightBrowser/2.0 (AgentBrowser)\"\n            )\n            page = await context.new_page()\n            await page.goto(url, wait_until=\"networkidle\", timeout=30000)\n\n            for step_num in range(min(max_steps, len(form_data) + 1)):\n                step_data = form_data[step_num] if step_num < len(form_data) else {}\n                step_result = FormResult(url=url)\n\n                # \u68c0\u6d4b\u5f53\u524d\u8868\u5355\n                forms = await page.evaluate(\"\"\"() => {\n                    return [...document.querySelectorAll('form')].map(f => ({\n                        id: f.id,\n                        action: f.action,\n                        fields: [...f.querySelectorAll('input:not([type=\"hidden\"]), select, textarea')]\n                            .slice(0, 20).map(el => el.name || el.id || '')\n                    })).filter(f => f.fields.length > 0);\n                }\"\"\")\n\n                if not forms:\n                    break  # \u6ca1\u6709\u8868\u5355\u4e86\n\n                step_result.form_id = forms[0][\"id\"]\n                step_result.action = forms[0][\"action\"]\n\n                # \u586b\u5145\n                for field_name in forms[0][\"fields\"]:\n                    if field_name in step_data:\n                        value = step_data[field_name]\n                    else:\n                        value = self._infer_value(field_name, \"text\", \"\", [])\n                    if value:\n                        step_result.filled[field_name] = value\n                        await page.fill(f\"[name='{field_name}']\", value)\n\n                # \u627e\"\u4e0b\u4e00\u6b65\"\u6309\u94ae\n                next_btn = await page.evaluate(\"\"\"() => {\n                    const btns = [\n                        ...document.querySelectorAll('button'),\n                        ...document.querySelectorAll('input[type=\"submit\"]')\n                    ];\n                    for (const b of btns) {\n                        const t = (b.textContent || b.value || '').trim().toLowerCase();\n                        if (t.includes('next') || t.includes('\u4e0b\u4e00\u6b65') ||\n                            t.includes('continue') || t.includes('\u7ee7\u7eed') ||\n                            t.includes('proceed')) {\n                            return b.id || b.className || true;\n                        }\n                    }\n                    return null;\n                }\"\"\")\n\n                if next_btn:\n                    try:\n                        await page.click(f\"button:has-text('Next'), input[value*='next' i], \" +\n                                        f\"button:has-text('\u4e0b\u4e00\u6b65'), button:has-text('Continue')\")\n                    except:\n                        await page.evaluate(\"document.forms[0].submit()\")\n\n                    await page.wait_for_load_state(\"networkidle\", timeout=10000)\n                    await page.wait_for_timeout(500)\n\n                    step_result.submitted = True\n                    step_result.response_title = await page.title()\n                    result.steps.append(step_result)\n                else:\n                    # \u53ef\u80fd\u662f\u6700\u540e\u4e00\u6b65\n                    await page.evaluate(\"document.forms[0].submit()\")\n                    await page.wait_for_load_state(\"networkidle\", timeout=10000)\n                    step_result.submitted = True\n                    step_result.response_title = await page.title()\n                    result.steps.append(step_result)\n                    break\n\n            result.completed = len(result.steps) > 0\n            result.total_steps = len(result.steps)\n            result.final_url = page.url\n            await context.close()\n\n        except Exception as e:\n            logger.error(f\"Multi-step wizard error: {e}\")\n\n        result.elapsed_ms = (time.time() - start) * 1000\n        return result\n"
+"""Agent Browser — Form Fill & Interaction Engine
+
+为 Agent 提供表单交互能力：
+- 自动识别表单字段（input/select/textarea）
+- 智能填充（根据字段名/placeholder 推断内容）
+- 表单提交 + 结果抓取
+- 支持多步表单（wizard/multi-step）
+- Cookie/Session 保持（同一 context 内复用）
+"""
+import logging
+import time
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
+
+logger = logging.getLogger("agent-browser.forms")
+
+@dataclass
+class FormField:
+    """单个表单字段"""
+    name: str
+    type: str = "text"
+    label: str = ""
+    placeholder: str = ""
+    required: bool = False
+    options: List[str] = field(default_factory=list)  # select options
+    value: Optional[str] = None
+
+@dataclass
+class FormResult:
+    url: str
+    form_id: str = ""
+    action: str = ""
+    method: str = "get"
+    fields: List[FormField] = field(default_factory=list)
+    filled: Dict[str, str] = field(default_factory=dict)
+    submitted: bool = False
+    response_title: str = ""
+    response_text: str = ""
+    error: str = ""
+    elapsed_ms: float = 0
+
+@dataclass
+class MultiStepResult:
+    url: str
+    steps: List[FormResult] = field(default_factory=list)
+    completed: bool = False
+    total_steps: int = 0
+    final_url: str = ""
+    elapsed_ms: float = 0
+
+class FormEngine:
+    """Agent 表单交互引擎"""
+
+    # 智能字段映射：根据字段名/placeholder 推断填充内容
+    FIELD_INFERENCE = {
+        "q": lambda: "search",
+        "search": lambda: "search",
+        "keyword": lambda: "search",
+        "query": lambda: "search",
+        "s": lambda: "search",
+        "email": lambda: "agent@insightbrowser.app",
+        "mail": lambda: "agent@insightbrowser.app",
+        "username": lambda: "agent_user",
+        "name": lambda: "Agent Browser",
+        "firstname": lambda: "Agent",
+        "lastname": lambda: "Browser",
+        "password": lambda: "Test1234!",
+        "pass": lambda: "Test1234!",
+        "phone": lambda: "13800138000",
+        "tel": lambda: "13800138000",
+        "mobile": lambda: "13800138000",
+        "city": lambda: "Beijing",
+        "address": lambda: "1 Agent Street",
+        "zip": lambda: "100000",
+        "zipcode": lambda: "100000",
+        "postal": lambda: "100000",
+        "comment": lambda: "This is an automated message from Agent Browser.",
+        "message": lambda: "Automated message from Agent Browser.",
+        "feedback": lambda: "Automated feedback from Agent Browser.",
+        "min_price": lambda: "0",
+        "max_price": lambda: "999999",
+        "price_min": lambda: "0",
+        "price_max": lambda: "999999",
+        "budget_min": lambda: "0",
+        "budget_max": lambda: "999999",
+        "date_from": lambda: "2026-01-01",
+        "date_to": lambda: "2026-12-31",
+        "checkin": lambda: "2026-05-01",
+        "checkout": lambda: "2026-05-03",
+        "guests": lambda: "2",
+        "adults": lambda: "2",
+        "currency": lambda: "CNY",
+        "lang": lambda: "zh-CN",
+        "language": lambda: "Chinese",
+        "country": lambda: "China",
+        "agree": lambda: "on",
+        "consent": lambda: "on",
+        "subscribe": lambda: "on",
+    }
+
+    async def detect_forms(self, renderer, url: str) -> List[dict]:
+        """检测页面所有表单"""
+        page = await renderer.render(url, wait_ms=1500, extract_forms=True)
+        from dataclasses import asdict
+        return asdict(page).get("forms", [])
+
+    async def fill_and_submit(self, renderer, url: str,
+                              form_index: int = 0,
+                              custom_fields: Optional[Dict[str, str]] = None,
+                              submit: bool = True) -> FormResult:
+        """填充并提交表单
+
+        Args:
+            renderer: AgentRenderer 实例
+            url: 页面 URL
+            form_index: 表单序号（0-based）
+            custom_fields: 自定义字段值 {"field_name": "value"}
+            submit: 是否提交
+        """
+        start = time.time()
+        result = FormResult(url=url)
+
+        try:
+            await renderer._ensure_browser()
+            context = await renderer._browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="InsightBrowser/2.0 (AgentBrowser)"
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(1000)
+
+            # Step 1: 获取表单列表
+            forms = await page.evaluate("""() => {
+                return [...document.querySelectorAll('form')].map((f, i) => ({
+                    index: i,
+                    id: f.id || '',
+                    action: f.action || window.location.href,
+                    method: (f.method || 'get').toLowerCase(),
+                    fields: [...f.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
+                        'select, textarea'
+                    )].slice(0, 30).map(el => ({
+                        name: el.name || el.id || '',
+                        type: el.type || el.tagName.toLowerCase(),
+                        label: (() => {
+                            // try label[for]
+                            if (el.id) {
+                                const lbl = document.querySelector('label[for="' + el.id + '"]');
+                                if (lbl) return lbl.textContent.trim();
+                            }
+                            // try parent label
+                            const parent = el.closest('label');
+                            if (parent) return parent.textContent.replace(el.textContent, '').trim();
+                            // try sibling label
+                            const prev = el.previousElementSibling;
+                            if (prev && prev.tagName === 'LABEL') return prev.textContent.trim();
+                            // try placeholder as fallback
+                            return el.placeholder || '';
+                        })().substring(0, 100),
+                        placeholder: (el.placeholder || '').substring(0, 100),
+                        required: !!el.required,
+                        options: el.tagName === 'SELECT' ?
+                            [...el.querySelectorAll('option')].slice(0, 50).map(o => o.value || o.textContent.trim()) : [],
+                    }))
+                })).filter(f => f.fields.length > 0);
+            }""")
+
+            if not forms or form_index >= len(forms):
+                result.error = f"No forms found or form_index {form_index} out of range ({len(forms)} forms)"
+                await context.close()
+                return result
+
+            target_form = forms[form_index]
+            result.form_id = target_form["id"]
+            result.action = target_form["action"]
+            result.method = target_form["method"]
+
+            for f in target_form["fields"]:
+                result.fields.append(FormField(
+                    name=f["name"],
+                    type=f["type"],
+                    label=f["label"],
+                    placeholder=f["placeholder"],
+                    required=f["required"],
+                    options=f.get("options", [])
+                ))
+
+            # Step 2: 智能填充
+            for field in target_form["fields"]:
+                name = field["name"]
+                if not name:
+                    continue
+
+                # 优先使用自定义值
+                if custom_fields and name in custom_fields:
+                    value = custom_fields[name]
+                else:
+                    value = self._infer_value(name, field["type"], field["placeholder"], field.get("options", []))
+
+                if value is None:
+                    continue
+
+                result.filled[name] = value
+
+                # 执行填充
+                if field["type"] == "select" or field["type"] == "select-one":
+                    if value in field.get("options", []):
+                        await page.select_option(f"[name='{name}']", value)
+                elif field["type"] == "checkbox":
+                    await page.check(f"[name='{name}']")
+                elif field["type"] == "radio":
+                    await page.check(f"[name='{name}'][value='{value}']")
+                elif field["type"] == "textarea":
+                    await page.fill(f"textarea[name='{name}']", value)
+                else:
+                    await page.fill(f"[name='{name}']", value)
+
+            # Step 3: 提交
+            if submit:
+                # 点击第一个 submit 按钮
+                try:
+                    submit_btn = await page.query_selector(
+                        "button[type='submit'], input[type='submit'], form button:last-child"
+                    )
+                    if submit_btn:
+                        await submit_btn.click()
+                    else:
+                        # JS submit
+                        await page.evaluate(f"document.forms[{form_index}].submit()")
+                except Exception as e:
+                    logger.warning(f"Submit click failed: {e}")
+
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                await page.wait_for_timeout(1000)
+
+                result.submitted = True
+                result.response_title = await page.title()
+                result.response_text = await page.evaluate(
+                    "() => document.body?.innerText?.substring(0, 5000) || ''"
+                )
+
+            await context.close()
+
+        except Exception as e:
+            result.error = str(e)[:300]
+            logger.error(f"Form fill error for {url}: {e}")
+
+        result.elapsed_ms = (time.time() - start) * 1000
+        return result
+
+    def _infer_value(self, name: str, ftype: str, placeholder: str, options: list) -> Optional[str]:
+        """智能推断字段值"""
+        name_lower = name.lower().strip()
+
+        # 精确匹配
+        if name_lower in self.FIELD_INFERENCE:
+            return self.FIELD_INFERENCE[name_lower]()
+
+        # 模糊匹配
+        for pattern, fn in self.FIELD_INFERENCE.items():
+            if pattern in name_lower:
+                return fn()
+
+        # 从 placeholder 推断
+        if placeholder.lower() in self.FIELD_INFERENCE:
+            return self.FIELD_INFERENCE[placeholder.lower()]()
+
+        # Select: 选第一个非空选项
+        if ftype in ("select", "select-one") and options:
+            for opt in options:
+                if opt and opt not in ("", "0"):
+                    return opt
+
+        return None
+
+    async def multi_step_wizard(self, renderer, url: str,
+                                form_data: List[Dict[str, str]],
+                                max_steps: int = 5) -> MultiStepResult:
+        """处理多步表单向导
+
+        Args:
+            url: 起始 URL
+            form_data: 每个步骤的填充数据
+            max_steps: 最大步数
+        """
+        start = time.time()
+        result = MultiStepResult(url=url)
+
+        try:
+            await renderer._ensure_browser()
+            context = await renderer._browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="InsightBrowser/2.0 (AgentBrowser)"
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            for step_num in range(min(max_steps, len(form_data) + 1)):
+                step_data = form_data[step_num] if step_num < len(form_data) else {}
+                step_result = FormResult(url=url)
+
+                # 检测当前表单
+                forms = await page.evaluate("""() => {
+                    return [...document.querySelectorAll('form')].map(f => ({
+                        id: f.id,
+                        action: f.action,
+                        fields: [...f.querySelectorAll('input:not([type="hidden"]), select, textarea')]
+                            .slice(0, 20).map(el => el.name || el.id || '')
+                    })).filter(f => f.fields.length > 0);
+                }""")
+
+                if not forms:
+                    break  # 没有表单了
+
+                step_result.form_id = forms[0]["id"]
+                step_result.action = forms[0]["action"]
+
+                # 填充
+                for field_name in forms[0]["fields"]:
+                    if field_name in step_data:
+                        value = step_data[field_name]
+                    else:
+                        value = self._infer_value(field_name, "text", "", [])
+                    if value:
+                        step_result.filled[field_name] = value
+                        await page.fill(f"[name='{field_name}']", value)
+
+                # 找"下一步"按钮
+                next_btn = await page.evaluate("""() => {
+                    const btns = [
+                        ...document.querySelectorAll('button'),
+                        ...document.querySelectorAll('input[type="submit"]')
+                    ];
+                    for (const b of btns) {
+                        const t = (b.textContent || b.value || '').trim().toLowerCase();
+                        if (t.includes('next') || t.includes('下一步') ||
+                            t.includes('continue') || t.includes('继续') ||
+                            t.includes('proceed')) {
+                            return b.id || b.className || true;
+                        }
+                    }
+                    return null;
+                }""")
+
+                if next_btn:
+                    try:
+                        await page.click(f"button:has-text('Next'), input[value*='next' i], " +
+                                        f"button:has-text('下一步'), button:has-text('Continue')")
+                    except:
+                        await page.evaluate("document.forms[0].submit()")
+
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    await page.wait_for_timeout(500)
+
+                    step_result.submitted = True
+                    step_result.response_title = await page.title()
+                    result.steps.append(step_result)
+                else:
+                    # 可能是最后一步
+                    await page.evaluate("document.forms[0].submit()")
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    step_result.submitted = True
+                    step_result.response_title = await page.title()
+                    result.steps.append(step_result)
+                    break
+
+            result.completed = len(result.steps) > 0
+            result.total_steps = len(result.steps)
+            result.final_url = page.url
+            await context.close()
+
+        except Exception as e:
+            logger.error(f"Multi-step wizard error: {e}")
+
+        result.elapsed_ms = (time.time() - start) * 1000
+        return result
