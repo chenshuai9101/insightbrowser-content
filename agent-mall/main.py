@@ -53,6 +53,10 @@ async def root():
 
 # Agent 身份
 agents_db: dict[str, dict] = {}
+# 身份审计日志（按 agent_id 索引，记录每次变更）
+identity_audit_log: dict[str, list[dict]] = {}
+# 独立信誉系统（按 wallet_address 索引，不受 agent_id 变更影响）
+reputation_db: dict[str, dict] = {}
 # 店铺
 stores_db: dict[str, dict] = {}
 # 商场
@@ -78,6 +82,7 @@ class AgentUpdate(BaseModel):
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
     category: Optional[str] = None
+    change_reason: Optional[str] = None  # 变更原因，用于审计日志
 
 class StoreCreate(BaseModel):
     agent_id: str
@@ -151,6 +156,23 @@ async def register_agent(req: AgentRegister):
         "updated_at": time.time(),
     }
     agents_db[agent_id] = agent
+    
+    # 初始化独立信誉（用 wallet_address 做锚点）
+    wallet = req.wallet_address or agent_id
+    if wallet not in reputation_db:
+        reputation_db[wallet] = {
+            "wallet_address": wallet,
+            "agent_ids": [agent_id],
+            "rating": 0.0,
+            "total_sales": 0,
+            "total_reviews": 0,
+            "dispute_rate": 0.0,
+            "verified": False,
+            "first_registered_at": time.time(),
+        }
+    else:
+        reputation_db[wallet]["agent_ids"].append(agent_id)
+    
     return agent
 
 
@@ -166,11 +188,44 @@ async def update_agent(agent_id: str, req: AgentUpdate):
     if agent_id not in agents_db:
         raise HTTPException(404, "Agent not found")
     agent = agents_db[agent_id]
-    for k, v in req.model_dump(exclude_none=True).items():
-        if v is not None:
+    update_data = req.model_dump(exclude_none=True)
+    change_reason = update_data.pop("change_reason", None)
+    
+    # 记录变更前的值
+    changed_fields = {}
+    for k, v in update_data.items():
+        if v is not None and agent.get(k) != v:
+            changed_fields[k] = {"old": agent.get(k), "new": v}
             agent[k] = v
+    
     agent["updated_at"] = time.time()
+    
+    # 写入审计日志
+    if changed_fields:
+        wallet = agent.get("wallet_address", agent_id)
+        if agent_id not in identity_audit_log:
+            identity_audit_log[agent_id] = []
+        identity_audit_log[agent_id].append({
+            "timestamp": time.time(),
+            "changed_fields": changed_fields,
+            "change_reason": change_reason or "unspecified",
+            "wallet_address": wallet,
+        })
+    
     return agent
+
+
+@app.get("/api/v1/agents/{agent_id}/audit-log")
+async def get_agent_audit_log(agent_id: str):
+    """获取 Agent 身份变更审计日志"""
+    if agent_id not in agents_db:
+        raise HTTPException(404, "Agent not found")
+    logs = identity_audit_log.get(agent_id, [])
+    return {
+        "agent_id": agent_id,
+        "total_changes": len(logs),
+        "changes": logs,
+    }
 
 
 @app.get("/api/v1/agents")
@@ -189,7 +244,45 @@ async def verify_agent(agent_id: str):
         raise HTTPException(404)
     agents_db[agent_id]["reputation"]["verified"] = True
     agents_db[agent_id]["updated_at"] = time.time()
+    # 同步到独立信誉
+    wallet = agents_db[agent_id].get("wallet_address", agent_id)
+    if wallet in reputation_db:
+        reputation_db[wallet]["verified"] = True
     return agents_db[agent_id]
+
+
+@app.get("/api/v1/reputation/{wallet_address}")
+async def get_reputation(wallet_address: str):
+    """通过钱包地址查询信誉（稳定锚点，不受 agent_id 变更影响）"""
+    if wallet_address not in reputation_db:
+        raise HTTPException(404, "No reputation found for this wallet")
+    return reputation_db[wallet_address]
+
+
+@app.post("/api/v1/reputation/{wallet_address}/migrate")
+async def migrate_reputation(wallet_address: str, new_agent_id: str):
+    """将信誉迁移到新的 agent_id（SOUL.md 重写后保持信誉连续）"""
+    if wallet_address not in reputation_db:
+        raise HTTPException(404, "No reputation found for this wallet")
+    if new_agent_id not in agents_db:
+        raise HTTPException(404, "New agent not found")
+    rep = reputation_db[wallet_address]
+    if new_agent_id not in rep["agent_ids"]:
+        rep["agent_ids"].append(new_agent_id)
+    # 同步信誉到新 Agent
+    agents_db[new_agent_id]["reputation"] = {
+        "rating": rep["rating"],
+        "total_sales": rep["total_sales"],
+        "total_reviews": rep["total_reviews"],
+        "dispute_rate": rep["dispute_rate"],
+        "verified": rep["verified"],
+    }
+    return {
+        "status": "migrated",
+        "wallet_address": wallet_address,
+        "new_agent_id": new_agent_id,
+        "reputation": rep,
+    }
 
 
 # ═══════════════════════════════════════════════════════════
